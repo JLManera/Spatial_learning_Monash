@@ -1,0 +1,483 @@
+---
+title: "data-wrangling-spatial-learning-amitriptyline"
+author: "Jack L Manera"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    code_download: true
+    code_folding: hide
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+---
+
+<!--
+# Document Overview
+
+Purpose
+End-to-end wrangling of spatial-learning fish trials (amitriptyline exposure), starting from 'idtracker.ai' outputs and ending with an analysis-ready dataframe.
+
+Inputs
+- Raw tracks: `trajectories.csv` (within `with_gaps_csv/`)
+- Regions of interest (maze zones) & frame rates: `tracking_ROI_and_framerates.csv`
+- Start times & trimming info: `tracking_start_times.xlsx`
+- Metadata on treatment & sex: `treatment_and_sex_data.xlsx` (Sheet "Sheet2")
+- Morphometrics: `1-videos/3-morph_pics/measurements.xlsx`
+
+Outputs
+- Per-session processed tracks: `./2-data/2-smoothed_tracks/*.csv`
+- Final analysis table: `./2-data/final_df.csv`
+
+Pipeline
+1. Set knit options (silence messages/warnings, caching, tidy output).
+2. Install/load packages and small helper for string parsing.
+3. Discover raw trajectory files from the idtracker.ai folder structure.
+4. Import Regions of interest (ROI) vertices; compute pixels-per-cm and group means to convert pixel coordinates to cm coordinates; plot distribution for quality check.
+5. Define session-specific trimming (early tracking artefacts); dropped frames are later added back to preserve true latencies.
+6. Build zone polygons (cm) for decision/correct/incorrect areas and define a function that assigns each position to a zone.
+7. Per session: trim → calibrate (px → cm) → smooth paths → assign zones → save per-session CSV.
+8. Summarise trials: first-entry latencies for each zone, trial end time, total distance, mean velocity, and count of incorrect choices; retain key metadata.
+9. Join behavioural metrics with treatment/sex and morphometrics; apply release-time offsets (tanks 1–2 vs 3–4) so all latencies are referenced to the exact release moment; filter exclusions.
+10. Export the final, time-corrected dataset for downstream statistical analysis.
+
+Notes
+- Smoothing uses `cleanRfish::find_smooth_path(method = "MAD", connection_method = "spline")`.
+- All timing is ultimately aligned to true release time after adjustments.
+-->
+
+# Setup Chunk
+
+This chunk sets global options to suppress messages, warnings, and enable caching for faster reruns.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  cache   = TRUE,
+  tidy    = TRUE
+)
+```
+
+#1. Install & Load Required Packages
+
+Load packages for data manipulation, plotting, spatial operations, smoothing, and file I/O.
+Includes a helper function to extract elements from split strings.
+
+```{r packages}
+# Install from GitHub
+# remotes::install_github("JLManera/cleanRfish")
+
+#If 'pacman' is not already installed please un-hash and run the line below
+#install.packages("pacman")
+
+# Core packages for manipulation and plotting
+pacman::p_load(tidyverse, ggplot2, sf, zoo, readxl, cleanRfish, stringr, data.table, install = TRUE, update = TRUE)
+
+# Helper: extract the i-th piece after splitting by pattern
+global_str_split_i <- function(string, pattern, i) {
+  sapply(string, function(x) stringr::str_split(x, pattern)[[1]][i])
+}
+```
+
+# 2. Locate trajectory files & calibration
+
+## 2.1 Locate Trajectory Files
+
+Traverse the idtracker.ai output folder structure and recursively find all trajectories.csv files, keeping only those inside with_gaps_csv directories (i.e., raw tracks with gaps preserved).
+
+```{r paths}
+parent_directory <- "./2-data/1-tracks"
+
+csv_files <- list.files(
+  path       = parent_directory,
+  pattern    = "trajectories\\.csv$",
+  recursive  = TRUE,
+  full.names = TRUE
+)
+```
+
+## 2.2 Read & Process Calibration Masks
+
+Pixel coordinates for the vertices of each maze region (ROI) are stored in tracking_ROI_and_framerates.csv.
+We use known real-world distances to calibrate pixel coordinates to centimetres. Compute two long-edge distances per tank, average them, and convert to pixels-per-cm. Replace per-tank values with the group mean (four tanks per frame) for consistency. Plot the distribution of pixels-per-cm to visually flag outliers.
+
+```{r calibration}
+video_masks_df <- read_csv("./2-data/tracking_ROI_and_framerates.csv") |>
+  select(-c(point_order, mean, max, min, area)) |>
+  pivot_wider(names_from = point, values_from = c(x, y)) |>
+  mutate(pixels_per_cm = ((sqrt((x_1 - x_6)^2 + (y_1 - y_6)^2) + sqrt((x_7 - x_12)^2 + (y_7 - y_12)^2)) / 2) / 25, 
+         ID = paste(group, tank))
+
+group_avg_pixels <- video_masks_df |>
+  filter(pixels_per_cm >= 12) |>
+  group_by(group) |>
+  summarize(avg_pixels_per_cm = mean(pixels_per_cm, na.rm = TRUE))
+
+video_masks_df <- video_masks_df |>
+  left_join(group_avg_pixels, by = "group") |>
+  mutate(pixels_per_cm = avg_pixels_per_cm) |>
+  select(-avg_pixels_per_cm)
+
+ggplot(video_masks_df, aes(x = pixels_per_cm)) +
+  geom_histogram(bins = 60) +
+  facet_wrap( ~ cam) +
+  labs(title = "Calibration Distribution", x = "Pixels per cm", y = "Count")
+```
+
+## 2.3 Specify Session-Specific Trimming
+
+Most videos have simultaneous release across tanks, but some do not, and some have early tracking artefacts (e.g., ripples).
+For these cases, we drop a tank-specific number of initial frames and later add that time back so all latency measures are referenced to the exact release moment.
+This table defines the trim (in frames) for affected video–tank combinations.
+
+```{r trim_info}
+trim_info <- tribble(
+  ~ video_name,
+  ~ trim_frame,
+  "cam4-b3-d1-t1_edit_tank1",
+  1350,
+  "cam7-b2-d1-t3_edit_tank3",
+  1400,
+  "cam9-b1-d1-t1_edit_tank1",
+  200,
+  "cam9-b1-d1-t1_edit_tank2",
+  200,
+  "cam9-b1-d1-t1_edit_tank3",
+  200,
+  "cam9-b1-d1-t1_edit_tank4",
+  200,
+  "cam9-b3-d1-t2_edit_tank2",
+  450,
+  "cam2-b1-d2-t2_edit_tank1",
+  150,
+  "cam6-b1-d1-t1_edit_tank4",
+  180
+)
+```
+
+# 3. Define Zone-Assignment Function
+
+Here we build spatial polygons for each decision, correct, and incorrect zone in centimetres, using calibration information from the ROI file.
+Each polygon corresponds to a physical area in the maze; entering certain zones indicates whether the fish made a correct or incorrect choice.
+This function assigns every recorded position to one of these zones, preserving the full temporal sequence of frames.
+
+```{r determine_zones}
+determine_zone_per_session <- function(df, zoning_info) {
+  zones <- list(
+    list(name = "Decision Zone 1", points = c(2, 3, 16, 10, 11)),
+    list(name = "Correct Zone 1", points = c(3, 4, 15, 16)),
+    list(name = "Incorrect Zone 1", points = c(10, 9, 15, 16)),
+    list(name = "Decision Zone 2", points = c(4, 5, 14, 8, 9)),
+    list(name = "Incorrect Zone 2", points = c(5, 6, 13, 14)),
+    list(name = "Correct Zone 2", points = c(7, 8, 14, 13))
+  )
+  pix2cm <- zoning_info$pixels_per_cm[1]
+  
+  zone_polygons <- lapply(zones, function(z) {
+    pts <- z$points
+    coords <- data.frame(x = as.numeric(zoning_info[1, paste0("x_", pts)]) / pix2cm,
+                         y = as.numeric(zoning_info[1, paste0("y_", pts)]) / pix2cm)
+    coords <- rbind(coords, coords[1, ])
+    st_polygon(list(as.matrix(coords)))
+  })
+  
+  zones_sf <- st_sf(zone_name = sapply(zones, `[[`, "name"),
+                    geometry  = st_sfc(zone_polygons))
+  
+  fish_sf <- st_as_sf(filter(df, !is.na(x)), coords = c("x", "y"))
+  assigned <- st_join(fish_sf, zones_sf, join = st_within) |> select(time, zone_name)
+  
+  merge(df, assigned, by = "time")
+}
+```
+
+# 4. Main Processing Pipeline
+
+This section loops through every tracked session and performs the core data-processing steps:
+- Exclude sessions with missing fish or incorrect trial starts (based on manual scoring).
+- Apply session-specific frame trimming when required.
+- Join calibration data to convert from pixels to centimetres.
+- Smooth position data to remove tracking artefacts.
+- Assign each position to its respective zone.
+- Save the processed track data to disk for later summarisation.
+
+```{r process_save_each_trial, cache=TRUE, tidy=TRUE}
+errors_df <- read_excel("./2-data/tracking_start_times.xlsx")
+
+exclude_sessions <- errors_df |>
+  select(unique_id, missing_fish, `wrong_start`) |>
+  pivot_longer(-unique_id, names_to = "issue", values_to = "tanks") |>
+  filter(!is.na(tanks)) |>
+  separate_rows(tanks, sep = ",") |>
+  mutate(session_name = paste0(unique_id, "_edit_tank", str_trim(tanks))) |>
+  pull(session_name) |> unique()
+
+release_info <- errors_df |>
+  select(
+    unique_id,
+    tanks1_2_release = `tanks1&2_release`,
+    tanks3_4_release = `tanks3&4_release`,
+    start_frame = start
+  )
+
+output_track_dir <- "./2-data/2-smoothed_tracks"
+
+if (!dir.exists(output_track_dir))
+  dir.create(output_track_dir, recursive = TRUE)
+
+not_calibrate_ids <- character()
+
+for (csv_file in csv_files) {
+  session_name <- sub(".*session_", "", dirname(dirname(dirname(csv_file))))
+  group_part   <- global_str_split_i(session_name, "-t", 1)
+  tank_part    <- substr(session_name, nchar(session_name), nchar(session_name))
+  ID           <- paste(group_part, tank_part)
+  print(ID)
+  trial_round  <- substr(global_str_split_i(session_name, "-t", 2), 1, 1)
+  
+  if (session_name %in% exclude_sessions)
+    next
+  
+  trajectories_df <- read_csv(csv_file) |>
+    dplyr::select(-any_of("time")) |>
+    mutate(
+      row_num = row_number(),
+      ID = ID,
+      session_name = session_name,
+      trial_round = trial_round,
+      track_trim = NA
+    )
+  
+  if (session_name %in% trim_info$video_name) {
+    tf <- filter(trim_info, video_name == session_name)$trim_frame
+    trajectories_df <- trajectories_df |>
+      filter(row_num > tf) |>
+      mutate(track_trim = tf)
+  }
+  
+  zoning_info <- filter(video_masks_df, ID == !!ID)
+  if (nrow(zoning_info) != 1) {
+    not_calibrate_ids <- c(not_calibrate_ids, ID)
+    next
+  }
+  
+  df <- trajectories_df |> left_join(zoning_info, by = "ID") |> mutate(
+    x_original   = trajectories1 / pixels_per_cm,
+    y_original   = trajectories2 / pixels_per_cm,
+    x1 = x_original,
+    y1 = y_original,
+    time = row_num / frame_rate
+  )
+  
+  if (sum(!is.na(df$x_original)) < 100) {
+    not_calibrate_ids <- c(not_calibrate_ids, ID)
+    next
+  }
+  
+  smooth_df <- cleanRfish::find_smooth_path(
+    df,
+    method            = "MAD",
+    connection_method = "spline",
+    min_points        = 25,
+    time_bias         = 10
+  ) |>
+    rename(
+      x          = x_filled,
+      y          = y_filled,
+      original_x = original_x1,
+      original_y = original_y1
+    ) |>
+    select(-c(x_smooth1, y_smooth1))
+  
+  zone_df <- determine_zone_per_session(smooth_df, zoning_info) |> mutate(
+    ID = ID,
+    session_name = session_name,
+    trial_round = trial_round,
+    frame_rate = zoning_info$frame_rate[1],
+    pixels_per_cm = zoning_info$pixels_per_cm[1],
+    group = zoning_info$group[1],
+    tank = zoning_info$tank[1],
+    cam = zoning_info$cam[1],
+    batch = zoning_info$batch[1],
+    day = zoning_info$day[1],
+    track_trim = unique(trajectories_df$track_trim)
+  )
+  
+  write_csv(zone_df, file.path(output_track_dir, paste0(session_name, ".csv")))
+}
+```
+
+# 5. Summarise Each Trial’s Metrics
+
+##5.1 Summarise function
+
+For each trial, calculate behavioural metrics including:
+- Time to first entry into each decision, correct, and incorrect zone.
+- Total distance travelled before solving the maze.
+- Mean velocity until trial end.
+- Number of incorrect choices.
+Also retain key metadata so results can be linked to experimental variables.
+
+```{r summarise_trial}
+summarise_trial <- function(trial_data) {
+  zone_order <- c(
+    "Decision Zone 1",
+    "Correct Zone 1",
+    "Incorrect Zone 1",
+    "Decision Zone 2",
+    "Incorrect Zone 2",
+    "Correct Zone 2"
+  )
+  
+  zone_col_names <- paste0("time_to_", gsub(" ", "_", tolower(zone_order)))
+  
+  correct_zone2_entries <- trial_data |>
+    filter(zone_name == "Correct Zone 2")
+  
+  time_end <- if (nrow(correct_zone2_entries) == 0) {
+    max(trial_data$time, na.rm = TRUE)
+  } else {
+    min(correct_zone2_entries$time)
+  }
+  
+  trial_subset <- trial_data |>
+    filter(time <= time_end) |>
+    arrange(time)
+  
+  zone_times <- map_dbl(zone_order, ~ {
+    entries <- trial_subset |> filter(zone_name == .x)
+    if (nrow(entries) > 0)
+      min(entries$time)
+    else
+      NA_real_
+  }) |> set_names(zone_col_names)
+  
+  if (nrow(trial_subset) < 2) {
+    total_distance <- 0
+    mean_velocity <- 0
+  } else {
+    dx <- diff(trial_subset$x)
+    dy <- diff(trial_subset$y)
+    total_distance <- sum(sqrt(dx^2 + dy^2))
+    mean_velocity <- total_distance / time_end
+  }
+  
+  incorrect_entries <- trial_subset |>
+    mutate(prev_zone = lag(zone_name)) |>
+    filter(
+      (prev_zone == "Decision Zone 1"  &
+         zone_name == "Incorrect Zone 1") |
+        (prev_zone == "Decision Zone 2"  &
+           zone_name == "Incorrect Zone 2")
+    ) |> nrow()
+  
+  metadata <- trial_data |>
+    select(
+      group,
+      tank,
+      frame_rate,
+      pixels_per_cm,
+      starts_with("x_"),
+      starts_with("y_"),
+      cam,
+      batch,
+      day
+    ) |> slice(1)
+  
+  tibble::tibble(
+    time_end         = time_end,
+    total_distance   = total_distance,
+    mean_velocity    = mean_velocity,
+    incorrect_entries = incorrect_entries,!!!zone_times
+  ) |> bind_cols(metadata)
+}
+```
+
+## 5.2 Create Summary of Tracks
+
+Read all processed per-session CSVs from disk, apply the trial-summarisation function to each, and combine the results into a single dataframe containing metrics for every trial.
+
+```{r summary_tracks}
+track_dir <- "./2-data/2-smoothed_tracks"
+track_files <- list.files(track_dir, pattern = "\\.csv$", full.names = TRUE)
+
+summary_df <- map_dfr(track_files, function(file) {
+  track <- read_csv(file, show_col_types = FALSE)
+  track |>
+    group_by(session_name, ID, trial_round) |>
+    group_modify( ~ summarise_trial(.x)) |>
+    ungroup()
+})
+```
+
+## 5.3 Final Linking & Time Adjustments
+
+Merge trial metrics with treatment, sex, and morphometric data.Incorporate original start-time offsets to correct all latency measures so they are referenced to the exact moment of fish release, accounting for tanks 1–2 and 3–4 being released at different times. Filter out any excluded individuals and prepare the final cleaned dataset.
+
+```{r final_adjustments}
+metadata <- read_excel("./2-data/treatment_and_sex_data.xlsx", sheet = "Sheet2")
+
+start_times <- read_excel("./2-data/tracking_start_times.xlsx")
+
+morphs <- read_excel("./1-videos/3-morph_pics/measurements.xlsx") |>
+  mutate(jar_ID = factor(ID)) |>
+  select(c(jar_ID, std_length))
+
+metadata <- left_join(metadata, morphs, by = "jar_ID")
+
+
+summary_df <- summary_df |> mutate(link = paste0(cam, "-", batch, "-", tank))
+metadata <- metadata |> mutate(link = paste0(camera, "-", batch, "-", tank)) |>
+  select(-c(tank, batch, camera))
+
+working_df <- left_join(summary_df, metadata, by = "link") |>
+  select(-starts_with("x_"), -starts_with("y_")) |>
+  mutate(unique_id = paste0("cam", cam, "-b", batch, "-d", day, "-t", trial_round))
+
+final_df <- left_join(working_df, start_times, by = "unique_id") |>
+  dplyr::filter(!jar_ID == 125) |>
+  mutate(
+    time_to_decision_zone_1 = ifelse(
+      tank %in% c(1, 2),
+      time_to_decision_zone_1 + ((start - `tanks1&2_release`) / frame_rate),
+      time_to_decision_zone_1 + (`tanks3&4_release` / frame_rate)
+    ),
+    time_to_decision_zone_2 = ifelse(
+      tank %in% c(1, 2),
+      time_to_decision_zone_2 + ((start - `tanks1&2_release`) / frame_rate),
+      time_to_decision_zone_2 + ((start - `tanks3&4_release`) / frame_rate)
+    ),
+    time_to_correct_zone_1 = ifelse(
+      tank %in% c(1, 2),
+      time_to_correct_zone_1 + ((start - `tanks1&2_release`) / frame_rate),
+      time_to_correct_zone_1 + ((start - `tanks3&4_release`) / frame_rate)
+    ),
+    time_to_correct_zone_2 = ifelse(
+      tank %in% c(1, 2),
+      time_to_correct_zone_2 + ((start - `tanks1&2_release`) / frame_rate),
+      time_to_correct_zone_2 + ((start - `tanks3&4_release`) / frame_rate)
+    ),
+    time_to_incorrect_zone_1 = ifelse(
+      tank %in% c(1, 2),
+      time_to_incorrect_zone_1 + ((start - `tanks1&2_release`) / frame_rate),
+      time_to_incorrect_zone_1 + ((start - `tanks3&4_release`) / frame_rate)
+    ),
+    time_to_incorrect_zone_2 = ifelse(
+      tank %in% c(1, 2),
+      time_to_incorrect_zone_2 + ((start - `tanks1&2_release`) / frame_rate),
+      time_to_incorrect_zone_2 + ((start - `tanks3&4_release`) / frame_rate)
+    )
+  ) |> 
+  dplyr::select(-c(`...8`, notes))
+```
+
+#6 Export Final Dataframe
+
+Save the fully processed, time-corrected dataframe (final_df.csv) to the ./2-data/ directory for downstream statistical analysis.
+
+```{r final_adjustments}
+write_csv(final_df, "./2-data/final_df.csv")
+```

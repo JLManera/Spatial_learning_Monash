@@ -1,0 +1,2764 @@
+---
+title: "data-analysis-spatial-learning-amitriptyline"
+author: "Jack L Manera"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+#1. Setup
+
+This section prepares the analysis environment: loads packages, defines shared colour palettes, imports and tidies the dataset, creates centred/scaled covariates, and builds censored vs. uncensored analysis frames.
+
+##1.1 Loading the Required Packages
+
+This section loads the R packages necessary for data wrangling, visualisation, Bayesian modelling, and post-hoc inference. If any of the packages are not already installed, the code will install them automatically. However, for the first time runnings this, unhash the first two lines to install 'pacman' and ' cmdstanr'.
+
+```{r}
+#install.packages("pacman")
+#install.packages("cmdstanr", repos = c('https://stan-dev.r-universe.dev', getOption("repos")))
+pacman::p_load(tidyverse, readxl, ggplot2, gghalves, ggdist, ggpp , brms, emmeans, tidybayes, scales, bayesplot, patchwork, cmdstanr, bayestestR, ggh4x, marginaleffects, stringr, flextable, officer, purrr, install = TRUE, update = TRUE)
+#install_cmdstan(cores = 2, overwrite = TRUE)
+```
+
+##1.2 Setting the Colour Palette
+
+A custom colour palette is defined to represent treatment groups and sexes consistently across all analyses and visualisations.
+
+```{r}
+colour_control <- "#238f9d"
+colour_low <- "#f57634"
+colour_high <- "#a01813"
+colour_female <- "#5e3c99"
+colour_male <- "#018571"
+```
+
+
+##1.3 Reading in the Analysis Dataset
+
+The processed dataset is imported, filtered to remove incomplete cases, and pre-processed. Steps include:
+- Creating helper variables (trial index, release time offsets).
+- Rounding morphometric measurements (standard length) to 0.1 mm, reflecting measurement precision.
+- Explicitly setting factor levels for sex, treatment, and orientation to preserve consistent ordering.
+- Removing intermediate columns used only during earlier preprocessing.
+
+```{r}
+df <- data.table::fread("./2-data/final_df.csv") |>
+  filter(!is.na(sex),
+  !is.na(treatment),
+  !is.na(orientation),
+  !is.na(jar_ID)) |>
+  mutate(
+  individual_ID = factor(jar_ID),
+  trial = (((day - 1) * 3) + trial_round),
+  batch = factor(batch),
+  time_offset = ifelse(
+  tank == 3 |
+  tank == 4,
+  (start - `tanks3&4_release`) / frame_rate,
+  (start - `tanks1&2_release`) / frame_rate
+  ),
+  treatment_sex = paste(treatment, sex, sep = "."),
+  std_length = round(std_length, digits = 1)) |>
+  select(-c(wrong_start, missing_fish, `tanks3&4_release`, `tanks1&2_release`, unique_id, link, group, jar_ID)) |>
+  mutate(
+  sex = factor(sex, levels = c("M", "F")),
+  treatment = factor(treatment, levels = c("c", "l", "h")),
+  orientation = factor(orientation, levels = c("L", "R"))
+  )
+```
+
+##1.4 Centre-Scaling Standard Length Within Sex
+
+To remove mean size differences between males and females while retaining within-sex variation, standard length is centred and scaled separately by sex. This allows body size to be included as a covariate without conflating it with sex effects.
+
+```{r}
+df |> 
+  group_by(sex) |> 
+  summarise(
+  n_individuals = n_distinct(individual_ID),
+  mean_length = mean(std_length, na.rm = TRUE),
+  sd_length = sd(std_length, na.rm = TRUE),
+  .groups = "drop"
+  )
+
+df <- df |>
+  group_by(sex) |>
+  mutate(scaled_std_length = as.numeric(scale(std_length))) |>
+  ungroup()
+```
+
+##1.5 Handling Non-Finishing Trials (Right-Censoring)
+
+Some trials did not end with the fish reaching the food reward within the maximum trial duration of 15 minutes. These are treated as right-censored observations in models. Two datasets are created: one in which non-finishing trials are excluded, and one in which they are retained and coded with a censoring indicator (cens = "right"). For censored trials, the solve time is set to the maximum trial duration (900 seconds). Counts of censored observations are also printed by treatment and sex.
+
+```{r}
+df_complete <- df |>
+  mutate(
+  cens = ifelse(is.na(time_to_correct_zone_2), "right", "none"),
+  time_to_correct_zone_2 = ifelse(is.na(time_to_correct_zone_2), 900, time_to_correct_zone_2)
+  )
+
+df_nonachievers_rm <- df_complete |>
+  filter(cens != "right")
+
+table(df_complete$cens)
+
+df_complete |>
+  group_by(treatment, sex) |>
+  summarise(n_individuals = n_distinct(individual_ID))
+```
+
+
+##1.6 Visualising raw distributions
+
+This section inspects the empirical distributions of the two focal responses—solve time (seconds) and number of incorrect entries—to guide likelihood choices. Time appears log-normal; Number of errors are counts and look likely to be overdispersed, suggesting a negative binomial distribution may be the best fit.
+
+```{r}
+hist(df_nonachievers_rm$time_to_correct_zone_2,
+  breaks = 100,
+  main = "Time taken to solve the maze")
+
+hist(log(df_nonachievers_rm$time_to_correct_zone_2),
+  breaks = 100,
+  main = "Time taken to solve the maze")
+
+hist(df_nonachievers_rm$incorrect_entries,
+  breaks = 100,
+  main = "The number of incorrect decisions made")
+```
+
+
+#2. Analysis: Solve time
+
+We analyse latency to solve the maze. Starting with a simple lognormal model, we add individual learning slopes, incorporate right-censoring, test for non-linear trends, compare models with LOO, and settle on a parsimonious final model for inference.
+
+##2.1 Model 1 — Baseline fixed effects + nested random intercepts
+
+First, we model log-solve time with fixed effects for trial × treatment × sex and random intercepts per fish to capture baseline differences.
+
+###2.1.1 Model specification
+
+Solve time is modelled on the log scale with trial × treatment × sex interactions, plus orientation, batch, and within-sex centred–scaled standard length. Random intercepts for individual_ID account for repeated measures.
+
+```{r}
+time_model_formula1 <- bf(
+  time_to_correct_zone_2 ~ 1 +
+  trial * treatment * sex +
+  orientation +
+  scaled_std_length +
+  batch +
+  (1 | individual_ID),
+  family = lognormal()
+)
+```
+
+###2.1.2 Specifying priors
+
+Here we review brms defaults and set weakly informative priors that bound biologically plausible effect sizes on the log scale.
+
+####2.1.2.1 Inspecting priors
+
+Default priors are listed to check for flat or overly vague distributions. Biological reasoning is used to constrain plausible effect sizes, based on the maximum trial duration (900 s).
+
+```{r}
+get_prior(time_model_formula1, data = df_nonachievers_rm)
+```
+
+We observe that the estimated β coefficients are effectively flat. It is biologically implausible that the difference in mean solve time between male and female guppies—or between any other levels of our categorical predictors—would exceed the total trial duration. The trial time is capped at 15 minutes (900 seconds), which provides a natural upper bound for plausible effect sizes.
+
+Given this, we expect effects to be relatively small, not exceeding approximately a 10-fold increase or decrease in solve time (i.e., fold-changes between 0.1× and 10×). On the log scale, these limits correspond to:
+
+log(0.1) ≈ -2.302585 to log(10) ≈ 2.302585
+
+Therefore, most of the prior mass for the β coefficients should fall between −2.302585 and 2.302585.
+
+####2.1.2.2 Visualising a weakly informative effect-size prior
+
+A Normal(0, 2) prior is visualised, placing ~75% of the prior mass within biologically reasonable effect sizes (10× / 0.1× fold-change).
+
+```{r}
+x_values <- seq(-10, 10, length.out = 1000)
+
+general_effectsize_prior_identity <- data.frame(
+  x = x_values,
+  y = dnorm(x_values, mean = 0, sd = 2)
+)
+
+ggplot(general_effectsize_prior_identity, aes(x = x, y = y)) +
+  geom_line(color = "blue") + 
+  geom_vline(xintercept = 2.302585, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = -2.302585, color = "red", linetype = "dashed") +
+  theme_classic()
+```
+
+#### 2.1.2.3 Setting priors
+
+Weakly informative priors are defined for fixed effects, intercept, random effects SDs, and residual variance.
+
+```{r}
+priors <- c(
+  set_prior("normal(0,2)", class = "b"), 
+  set_prior("student_t(3, 3.7, 2.5)", class = "Intercept"),
+  set_prior("student_t(3, 0, 2.5)", class = "sd", lb = 0),
+  set_prior("student_t(3, 0, 2.5)", class = "sigma", lb = 0)
+)
+```
+
+#### 2.1.2.4 Fitting Prior-only model
+
+We fit the model using priors only to verify they generate biologically plausible values.
+
+```{r}
+time_model_prioronly <- brm(time_model_formula1, 
+  data = df_nonachievers_rm,
+  prior = priors,
+  sample_prior = "only",
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/time_model_prioronly",
+  init = 0,
+  seed = 1)
+```
+
+#### 2.1.2.5 Prior predictive checks
+
+Prior predictive simulations are examined to ensure priors generate biologically plausible solve times.
+
+```{r}
+pp_check(time_model_prioronly, type = 'stat', stat = 'min')
+
+pp_check(time_model_prioronly, type = "stat", stat = "mean") +
+  coord_cartesian(xlim = c(0, 900))
+
+pp_check(time_model_prioronly, type = 'stat', stat = 'max') +
+  coord_cartesian(xlim = c(0, 900))
+```
+
+###2.1.3 Fit Model 1
+
+This step fits the first candidate solve‐time model using a lognormal likelihood. The lognormal model is fitted with the specified priors, nested random intercepts, and high iteration settings to ensure convergence.
+
+```{r}
+time_model1 <- brm(time_model_formula1, 
+  data = df_nonachievers_rm,
+  prior = priors,
+  sample_prior = "yes",
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/time_model1",
+  init = 0,
+  seed = 1)
+summary(time_model1)
+```
+
+###2.1.4 Model diagnostics
+
+We validate Model 1 by checking MCMC convergence, comparing priors to posteriors, and assessing predictive fit with pp_checks.
+
+####2.1.4.1 Chain convergence
+
+Traceplots are inspected to confirm good chain mixing and convergence.
+
+```{r}
+plot(time_model1, ask = FALSE)
+```
+
+####2.1.4.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions.
+
+```{r}
+plot(hypothesis(time_model1, "sexF > 0"))
+plot(hypothesis(time_model1, "orientationR > 0"))
+plot(hypothesis(time_model1, "treatmenth > 0"))
+plot(hypothesis(time_model1, "trial > 0"))
+```
+
+
+####2.1.4.3 Posterior predictive checks
+
+Posterior predictive checks (pp_check) to assess the adequacy of the fitted model, including comparisons between simulated and observed data distributions and trial‐level means.
+
+```{r}
+pp_check(time_model1)
+pp_check(time_model1, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+pp_check(time_model1, type = "stat_2d", ndraws = 100)
+pp_check(time_model1, type = "stat_grouped", group = "trial", stat = "mean")
+```
+
+##2.2 Model 2 — Baseline fixed effects + random intercepts and slopes
+
+Model 1 allowed each fish to have its own random intercept, capturing differences in baseline solve times. However, this structure does not allow for variation in learning trajectories between individuals. Since fish are expected to improve across trials at different rates, we extend the model by introducing individual‐level random slopes for trial. This permits each fish to have its own fitted learning curve, while still accounting for batch effects through batch-level intercepts.
+
+###2.2.1 Model specification
+
+Model 2 therefore includes trial × treatment × sex interactions, orientation, batch, and within‐sex scaled standard length as fixed effects, with intercepts and slopes for trial at the individual level.
+
+```{r}
+time_model_formula2 <- bf(
+  time_to_correct_zone_2 ~ 1 +
+  trial * treatment * sex +
+  orientation +
+  scaled_std_length +
+  batch +
+  (1 + trial | individual_ID),
+  family = lognormal()
+)
+```
+
+### 2.2.2 Fit Model 2
+
+The model is fitted using the same priors and control parameters as Model 1, but with the extended random-effects structure.
+
+```{r}
+time_model2 <- brm(time_model_formula2, 
+  data = df_nonachievers_rm,
+  prior = priors,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/time_model2",
+  init = 0,
+  seed = 1)
+
+summary(time_model2)
+```
+
+### 2.2.3 Model diagnostics
+
+We examine convergence and prior sensitivity and use posterior predictive checks to confirm Model 2’s adequacy.
+
+####2.2.3.1 Chain convergence
+
+Traceplots are inspected to confirm good chain mixing and convergence.
+
+```{r}
+plot(time_model2, ask = FALSE)
+```
+
+####2.2.3.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions.
+
+```{r}
+plot(hypothesis(time_model2, "sexF > 0"))
+plot(hypothesis(time_model2, "orientationR > 0"))
+plot(hypothesis(time_model2, "treatmenth > 0"))
+plot(hypothesis(time_model2, "trial > 0"))
+```
+
+
+#### 2.2.3.3 Posterior predictive checks
+
+Posterior predictive checks (pp_check) to assess the adequacy of the fitted model, including comparisons between simulated and observed data distributions and trial‐level means.
+
+```{r}
+pp_check(time_model2) + coord_cartesian(xlim = c(0, 900))
+pp_check(time_model2, ndraws = 100, type = 'ecdf_overlay') + coord_cartesian(xlim = c(0, 900))
+pp_check(time_model2, type = "stat_2d", ndraws = 100)
+pp_check(time_model2, type = "stat_grouped", group = "trial", stat = "mean")
+```
+
+### 2.2.4 Model comparison using LOOIC
+
+Models 1 and 2 are compared using leave-one-out cross-validation (LOOIC).
+
+```{r}
+time_model1 <- add_criterion(time_model1, criterion = "loo")
+time_model2 <- add_criterion(time_model2, criterion = "loo")
+
+loo_compare(time_model1, time_model2)
+```
+
+Model 2 provides a substantially better fit, indicating that allowing individual-level learning curves captures important structure in the data.
+
+## 2.3 Model 3 — Censored distribution
+
+We reintroduce non-finishing trials as right-censored observations so all trials contribute information while retaining the lognormal mean structure.
+
+### 2.3.1 Model specification
+
+Model 3 extends Model 2 by incorporating right-censoring, thereby retaining trials in which fish did not reach the food reward within 900 seconds. This allows the model to account for censored data rather than excluding it, improving inference from the full dataset.
+
+```{r}
+time_model_formula3 <- bf(
+  time_to_correct_zone_2 | cens(cens) ~ 1 +
+  trial * treatment * sex +
+  orientation +
+  scaled_std_length +
+  batch +
+  (1 + trial | individual_ID),
+  family = lognormal()
+)
+```
+
+### 2.3.2 Fit Model 3
+
+The censored lognormal model is fitted to the complete dataset using the same priors and computational settings as earlier models.
+
+```{r}
+time_model3 <- brm(time_model_formula3,
+  data = df_complete,
+  prior = priors,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000,
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/time_model3",
+  init = 0,
+  seed = 1)
+
+summary(time_model3)
+```
+
+### 2.3.3 Model diagnostics
+
+As above, we check chain mixing, confirm results are not prior-driven, and use pp_checks to ensure the censored model reproduces key data features.
+
+####2.3.3.1 Chain convergence
+
+Traceplots are inspected to confirm good chain mixing and convergence.
+
+```{r}
+plot(time_model3, ask = FALSE)
+```
+
+####2.3.3.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions.
+
+```{r}
+plot(hypothesis(time_model3, "sexF > 0"))
+plot(hypothesis(time_model3, "orientationR > 0"))
+plot(hypothesis(time_model3, "treatmenth > 0"))
+plot(hypothesis(time_model3, "trial > 0"))
+```
+
+
+####2.3.3.3 Posterior predictive checks
+
+Posterior predictive checks are used to assess whether the censored model reproduces observed data distributions and trial-level means.
+
+```{r}
+pp_check(time_model3)
+pp_check(time_model3, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+pp_check(time_model3, type = "stat_2d", ndraws = 100)
+pp_check(time_model3, type = "stat_grouped", group = "trial", stat = "mean")
+```
+
+Note: Inspection of residual patterns suggests potential periodicity across trials within the same day (potentially linked to satiation, time-of-day, or fatigue effects). This motivates exploration of non-linear trial effects.
+
+## 2.4 Model 4 — Non-linear trend
+
+Model 4 explores the possibility that learning trajectories may be non-linear across trials, rather than strictly linear. To test this, the model incorporates spline smoothers that allow flexible, curved trends.
+
+### 2.4.1 Model specification
+
+To account for potential non-linear learning dynamics, spline smoothers are applied to trial. Separate smooths are estimated for the interaction between treatment and sex, for treatment, and for sex, in addition to a global smooth across all data. This permits the model to flexibly capture patterns such as plateaus or accelerations in solve times across trials.
+
+```{r}
+time_model_formula4 <- bf(
+  time_to_correct_zone_2 ~ 1 +
+  s(trial, k =5, by = interaction(treatment, sex)) +
+  s(trial, k =5, by = treatment) +
+  s(trial, k =5, by = sex) +
+  s(trial, k =10) +
+  treatment*sex +
+  orientation +
+  scaled_std_length +
+  batch +
+  (1 | individual_ID),
+  family = lognormal()
+)
+```
+
+### 2.4.2 Fit Model 4
+
+The spline-augmented model is fitted using the same priors and computational settings as previous models.
+
+```{r}
+time_model4 <- brm(time_model_formula4,
+  data = df_complete,
+  prior = priors,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000,
+  threads = threading(2),
+  chains = 4, cores = 4,
+  init = 0,
+  backend = 'cmdstanr',
+  file = "./4-models/time_model4",
+  seed = 1)
+
+summary(time_model4)
+```
+
+### 2.4.3 Model diagnostics
+
+We examine convergence and prior sensitivity and use posterior predictive checks to confirm the spline model’s adequacy.
+
+####2.4.3.1 Chain convergence
+
+Traceplots are inspected to confirm good chain mixing and convergence.
+
+```{r}
+plot(time_model4, ask = FALSE)
+```
+
+#### 2.4.3.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions.
+
+```{r}
+plot(hypothesis(time_model3, "sexF > 0"))
+plot(hypothesis(time_model3, "orientationR > 0"))
+plot(hypothesis(time_model3, "treatmenth > 0"))
+plot(hypothesis(time_model3, "trial > 0"))
+```
+
+#### 2.4.3.3 Posterior predictive checks
+
+We test whether the spline model reproduces the observed distribution and trial-wise patterns; any gain over the linear model should appear as better tail behaviour and within-trial means.
+
+```{r}
+pp_check(time_model3)
+pp_check(time_model3, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+pp_check(time_model3, type = "stat_2d", ndraws = 100)
+pp_check(time_model3, type = "stat_grouped", group = "trial", stat = "mean")
+```
+
+### 2.4.4 Assess linearity
+
+Predictions from the spline-based (Model 4) and linear (Model 3) models are compared to evaluate whether learning trajectories are better represented by a linear or non-linear structure.
+
+```{r}
+newdata <- data.frame(
+  trial = seq(min(df_complete$trial, na.rm = TRUE), max(df_complete$trial, na.rm = TRUE), length.out = 100),
+  treatment = "c",
+  sex = "F",
+  orientation = "L",
+  batch = "2",
+  scaled_std_length = 0
+)
+
+model_3_predicted_trend <- fitted(
+  time_model3,
+  newdata = newdata,
+  re_formula = NA,
+  scale = "response",
+  probs = c(0.025, 0.5, 0.975)) |> 
+  as.data.frame() |> 
+  mutate(model = "Linear (Model 3)")
+
+model_4_predicted_trend <- fitted(
+  time_model4,
+  newdata = newdata,
+  re_formula = NA,
+  scale = "response",
+  probs = c(0.025, 0.5, 0.975)) |> 
+  as.data.frame() |> 
+  mutate(model = "Spline (Model 4)")
+
+both_predictions <- bind_rows(bind_cols(newdata, model_3_predicted_trend), bind_cols(newdata, model_4_predicted_trend)) |> 
+  rename(
+  y = Estimate,
+  lo = Q2.5,
+  med = Q50,
+  hi = Q97.5
+  )
+
+ggplot(both_predictions, aes(x = trial, y = med, color = model, fill = model)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
+  geom_line(size = 1) +
+  labs(
+  x = "Trial",
+  y = "Predicted solve time (s)",
+  title = "Global predicted trend: Linear vs Spline",
+  subtitle = "Treatment = Control | Sex = Female | Orientation = Left | scaled_std_length = 0") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+Visual inspection of predictions from both the linear (Model 3) and spline (Model 4) formulations indicates that the estimated solve-time trajectories across trials are nearly identical. The spline model, despite its added flexibility, does not uncover meaningful deviations from linearity — there is no evidence of strong curvature, plateaus, or accelerations that are not already well captured by the linear specification.
+
+Because the linear and spline models yield comparable estimates, the added complexity of splines provides little additional explanatory power. In such cases, the principle of parsimony (Occam’s razor) suggests favouring the simpler model, which is easier to interpret, communicate, and apply in post-hoc inference.
+
+Therefore, for both clarity and interpretability of results, we proceed with the linear specification (Model 3) as the primary model for inference.
+
+```{r}
+time_model <- time_model3
+```
+
+## 2.5 Influence of priors
+
+To check that inferences are data-driven (not prior-driven), we refit the final model with default diffuse priors (“flat” with respect to brms defaults for the given family) and compare posterior summaries and predictive fit with the informed-prior model.
+
+### 2.5.1 Flat prior model
+
+This chunk refits the chosen model structure (censored lognormal with individual intercepts and trial slopes) without the weakly informative priors used earlier. Computational controls are held constant so differences reflect prior specification rather than sampler settings.
+
+```{r}
+time_model_no_priors <- brm(time_model_formula3, 
+  data = df_complete,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/time_model_no_priors",
+  init = 0,
+  seed = 1)
+
+summary(time_model_no_priors)
+```
+
+### 2.5.2 Influence of priors
+
+Here we:
+- Extract posterior draws for all fixed-effect coefficients from both fits,
+- Visualise coefficient-wise density overlays to spot any prior-induced shrinkage, and
+- Compare out-of-sample fit using LOO.
+
+```{r}
+draws_informed <- as_draws_df(time_model)
+draws_flat <- as_draws_df(time_model_no_priors)
+
+all_b <- grep("^b_", colnames(draws_informed), value = TRUE)
+
+post_inf <- draws_informed |>
+  select(all_of(all_b)) |>
+  pivot_longer(everything(),
+  names_to = "parameter",
+  values_to = "value") |>
+  mutate(model = "informed")
+
+post_flat <- draws_flat |>
+  select(all_of(all_b)) |>
+  pivot_longer(everything(),
+  names_to = "parameter",
+  values_to = "value") |>
+  mutate(model = "no_priors")
+
+bind_rows(post_inf, post_flat) |>
+  ggplot(aes(x = value, fill = model)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ parameter, scales = "free") +
+  labs(
+  title = "Posterior densities: informed priors vs no priors",
+  x = "Coefficient value",
+  y = "Density"
+  ) +
+  theme_minimal()
+
+time_model <- add_criterion(time_model, criterion = "loo")
+time_model_no_priors <- add_criterion(time_model_no_priors, criterion = "loo")
+
+loo_compare(time_model, time_model_no_priors)
+```
+
+ Posterior densities and LOO are effectively unchanged; conclusions are robust to prior choice.
+
+## 2.6 Effects
+
+The following chunks summarise model fit and quantify learning and covariate effects using marginal trends/means from the fitted model.
+
+### 2.6.1 Model summary
+
+This chunk prints the standard brms summary (fixed effects, random-effects SDs/correlations) and two measures of explained variance: Bayesian R² (in-sample) and LOO-R² (approximate out-of-sample). These provide complementary views of fit quality for a lognormal, censored response.
+
+```{r}
+summary(time_model)
+bayes_R2(time_model)
+loo_R2(time_model)
+```
+
+### 2.6.2 Learning rate differnces
+
+We quantify learning slopes (change in solve time per trial), test treatment and sex contrasts, and also report the overall/global learning rate.
+
+####2.6.2.1 Predictor effect estimates and contrasts of learning rate
+
+We use emtrends() to estimate the population-level learning rate (seconds / trial) by treatment × sex, marginalizing over other predictors and excluding random effects (re_formula = NA). Pairwise contrasts of these learning rates are computed with "revpairwise".
+
+```{r}
+marginal_estimates_and_contrasts_timemodel <- emtrends(time_model,"revpairwise" ~ treatment + sex, var = "trial", epred = TRUE, re_formula = NA)
+marginal_estimates_and_contrasts_timemodel
+```
+
+No meaningfully important differences in learning rate among treatments or between sexes.
+
+#### 2.6.2.2 Visualisation of learning rate contrasts
+
+We convert emtrends() results to draws and plot densities of trial-slope contrasts. Shaded regions near zero help assess practical equivalence; wide overlap with zero implies negligible differences.
+
+```{r}
+contrast_vis_time_model_draws <- emtrends(time_model,"revpairwise" ~ treatment + sex, var = "trial", epred = TRUE, re_formula = NA) |> 
+  gather_emmeans_draws() |> 
+  dplyr::filter(!is.na(contrast))
+
+ggplot(contrast_vis_time_model_draws, aes(x = contrast, y = .value)) +
+  stat_halfeye() +
+  geom_hline(yintercept = 0) +
+  coord_flip()+
+  theme_classic()
+```
+
+#### 2.6.2.3 Global learning rate
+
+Because no subgroup differences are evident, we obtain the marginal global learning slope (median and 95% CrI). Negative values indicate faster solving on later trials.
+
+```{r}
+global_learning_rate <- as.data.frame(emtrends(time_model, ~ 1, var = "trial", epred = TRUE, re_formula = NA))
+global_learning_rate
+```
+
+### 2.6.3 Absolute solve time differences
+
+Compute marginal mean solve times for each treatment × sex combination in each trial. Test pairwise contrasts to compare which groups solve faster at each stage.
+
+#### 2.6.3.1 Predictor effect estimates and contrasts of solve times
+
+This reports the global average estimate for each trial and also a table with the contrasts of the absolute time taken to solve the maze contrasted between all perumtations of sex and treatment across trials.
+
+```{r}
+res <- time_model |>
+  emmeans(~ 1 | trial,
+  at = list(trial = 1:12),
+  epred = TRUE,
+  re_formula = NA)
+
+res_df <- as.data.frame(res)
+res_df
+  
+time_model_contrasts <- time_model |> 
+  emmeans( "revpairwise" ~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA)
+
+filtered_contrasts <- as.data.frame(time_model_contrasts$contrasts) |>
+  dplyr::filter(contrast %in% c("h M - l M", "c M - l M", "c M - h M",
+  "h F - l F", "c F - l F", "c F - h F",
+  "l F - l M", "h F - h M", "c F - c M")) |>
+  dplyr::select(trial, contrast, estimate, lower.HPD, upper.HPD)
+
+kable(filtered_contrasts, digits = 2, 
+  col.names = c("Trial", "Contrast", "Estimate", "Lower HPD", "Upper HPD"),
+  caption = "Bayesian Contrast Estimates with 95% HPD Intervals",
+  format = "html",
+  table.attr = 'style="color: white; font-family: Arial, sans-serif;"')
+```
+
+#### 2.6.3.2 Visualisation of solve time contrasts
+
+Looking at the contrasts between sexes and treatments in each trial to see in which trials differences in solve time exist
+
+```{r}
+time_model_draws <- time_model |> 
+  emmeans( "revpairwise" ~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA) |>
+  gather_emmeans_draws()
+
+time_model_contrast_draws <- time_model_draws |> 
+  dplyr::filter(!is.na(contrast))
+
+unique(time_model_contrast_draws$contrast)
+
+time_model_contrast_draws <- time_model_draws |> 
+  dplyr::filter(contrast %in% c("h M - l M", "l M - c M", "h M - c M", "h F - l F", "l F - c F", "h F - c F", "l F - l M", "h F - h M", "c F - c M"))
+
+time_model_contrast_draws$contrast <- factor(time_model_contrast_draws$contrast, levels = c("h M - l M", "l M - c M", "h M - c M", "h F - l F", "l F - c F", "h F - c F", "l F - l M", "h F - h M", "c F - c M"))
+
+time_model_estimate_draws <- time_model_draws |> 
+  dplyr::filter(!is.na(treatment)) |> 
+  mutate(treatment = factor(treatment, levels = c("c", "l", "h")))
+
+ggplot(dplyr::filter(time_model_contrast_draws, contrast %in% c("h M - l M", "l M - c M", "h M - c M")), aes(x = contrast, y = .value, color = trial)) +
+  stat_halfeye(aes(group = trial), position = position_dodge()) +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  labs(title = "Contrasts of treatments within Sex 1",
+  x = "Treatment contrast and trial number",
+  y = "Marginal difference in seconds"
+  )+
+  coord_cartesian(ylim = c(-150, 150))
+
+ggplot(dplyr::filter(time_model_contrast_draws, contrast %in% c("h F - l F", "l F - c F", "h F - c F")), aes(x = contrast, y = .value, color = trial)) +
+  stat_halfeye(aes(group = trial), position = position_dodge()) +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  labs(title = "Contrasts of treatments within Sex 2",
+  x = "Treatment contrast and trial number",
+  y = "Marginal difference in seconds"
+  )+
+  coord_cartesian(ylim = c(-150, 150))
+
+ggplot(dplyr::filter(time_model_contrast_draws, contrast %in% c("l F - l M", "h F - h M", "c F - c M")), aes(x = contrast, y = .value, color = trial)) +
+  stat_halfeye(aes(group = trial), position = position_dodge()) +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  labs(title = "Contrasts of sexes across treatments",
+  x = "Treatment contrast and trial number",
+  y = "Marginal difference in seconds"
+  ) +
+  coord_cartesian(ylim = c(-150, 150))
+
+significant_regions <- time_model_contrast_draws |>
+  group_by(contrast, trial) |>
+  summarize(
+  lower = quantile(.value, 0.025),
+  upper = quantile(.value, 0.975),
+  .groups = "drop"
+  ) |>
+  mutate(
+  significant = (lower > 0) | (upper < 0),
+  xmin = ifelse(trial == 1, trial, trial - 0.5),
+  xmax = ifelse(trial == 12, trial, trial + 0.5),
+  ymin = -Inf,
+  ymax = Inf
+  ) |>
+  filter(significant == TRUE)
+
+ggplot() +
+  geom_rect(data = significant_regions, 
+  aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+  fill = "gray", alpha = 0.5) +
+  stat_lineribbon(data = time_model_contrast_draws, aes(x = trial, y = .value, fill = stat(level))) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 0.3) +
+  scale_fill_brewer() +
+  theme_classic() +
+  coord_cartesian(xlim = c(1, 12))+
+  theme(legend.position = "none") +
+  scale_x_continuous(
+  breaks = seq(1, 12, by = 1), 
+  labels = seq(1, 12, by = 1)) +
+  facet_wrap(~contrast)
+```
+
+#### 2.6.3.3 Covariate effects on solve time
+
+These estimate marginal differences in solve time by orientation, batch, and body size 
+
+```{r}
+orientation_table <- time_model |>
+  emmeans(~ orientation, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  transmute(
+  Variable = "Orientation",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+
+batch_table <- time_model |>
+  emmeans(~ batch, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  transmute(
+  Variable = "Batch",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+
+length_table <- time_model |>
+  emtrends(~ 1, var = "scaled_std_length", epred = TRUE, re_formula = NA) |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  transmute(
+  Variable = "Body size (scaled)",
+  `Contrast (for factors)` = "-",
+  `Trend (for covariates)` = "Per +1 SD in length",
+  Estimate = scaled_std_length.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+
+covariate_table <- bind_rows(orientation_table, batch_table, length_table) |>
+  mutate(across(c(Estimate, `Lower CrI`, `Upper CrI`), ~ round(.x, 2)))
+
+print(covariate_table, row.names = FALSE)
+```
+
+## 2.7 Plots
+
+Here we summarise raw group patterns and overlay fitted marginal trends to visualise learning dynamics and treatment/sex differences.
+
+### 2.7.1 Solve time by sex
+
+Plot raw group means (±SD) and fitted model predictions of solve time. Facet the plot by treatment to visualise differences in learning trajectories between sexes.
+
+```{r}
+time_plot_sex_comp <- ggplot() + 
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = time_to_correct_zone_2, color = sex),
+  fun = mean,
+  geom = "point",
+  size = 2,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = time_to_correct_zone_2, color = sex),
+  fun.data = mean_sdl,
+  fun.args = list(mult = 1),
+  geom = "errorbar",
+  width = 0.2,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_lineribbon(
+  data = time_model_estimate_draws,
+  aes(x = trial, y = .value, color = sex, fill = sex),
+  .width = 0.95, alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = time_model_estimate_draws,
+  aes(x = trial, y = .value, color = sex, fill = sex),
+  .width = 0
+  ) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+  x = "Trial Number",
+  y = "Time to solve (s)",
+  color = "Sex", fill = "Sex"
+  ) +
+  scale_color_manual(values = c(colour_female, colour_male)) + 
+  scale_fill_manual(values = c(colour_female, colour_male)) + 
+  theme_classic(base_size = 18, base_family = "Times New Roman") + 
+  ggh4x::facet_wrap2(
+  ~ treatment,
+  labeller = as_labeller(c("c" = "Control", "l" = "Low", "h" = "High")),
+  # strip = ggh4x::strip_themed(background_x = ggh4x::elem_list_rect(fill = c(
+  # c = alpha(colour_control, 0.9),
+  # l = alpha(colour_low, 0.9),
+  # h = alpha(colour_high, 0.9)
+  # )))
+  ) +
+  coord_cartesian(ylim = c(10,430))
+time_plot_sex_comp
+```
+
+### 2.7.2 Solve time by treatment
+
+Plot raw group means (±SD) and fitted model predictions of solve time. Facet the plot by sex to visualise differences in learning trajectories between treatments.
+
+```{r}
+time_plot_treatment_comp <- ggplot() +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = time_to_correct_zone_2, color = treatment),
+  fun = mean,
+  geom = "point",
+  size = 1,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = time_to_correct_zone_2, color = treatment),
+  fun.data = mean_sdl,
+  fun.args = list(mult = 1),
+  geom = "errorbar",
+  width = 0.2,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_lineribbon(
+  data = time_model_estimate_draws,
+  aes(
+  x = trial,
+  y = .value,
+  color = treatment,
+  fill = treatment
+  ),
+  .width = 0.95,
+  alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = time_model_estimate_draws,
+  aes(
+  x = trial,
+  y = .value,
+  color = treatment,
+  fill = treatment
+  ),
+  .width = 0
+  ) +
+  scale_x_continuous(
+  breaks = 1:12,
+  labels = 1:12) +
+  labs(x = "Trial Number",
+  y = "Time to solve (s)",
+  color = "Treatment",
+  fill = "Treatment") +
+  scale_color_manual(values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")) +
+  scale_fill_manual(values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +
+  theme(legend.title = element_text(size = 10),
+  legend.key.size = unit(0.6, "lines"),
+  legend.spacing.y = unit(0.2, "cm"),
+  legend.spacing.x = unit(0.2, "cm"),
+  legend.margin = margin(1, 1, 1, 1),
+  legend.position = c(1, 0.98), # Top-right inside the plot
+  legend.justification = c("right", "top"), # Anchor legend to its top-right corner
+  legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+  legend.key = element_rect(fill = "transparent", color = NA))+
+  coord_cartesian(ylim = c(10, 420)) +
+  ggh4x::facet_wrap2(
+  ~ sex,
+  labeller = as_labeller(c("F" = "Females", "M" = "Males")),
+  strip = ggh4x::strip_themed(
+  # background_x = ggh4x::elem_list_rect(fill = c(
+  # F = alpha(colour_female, 0.4),
+  # M = alpha(colour_male, 0.4)
+  # )),
+  text_x = ggh4x::elem_list_text(size = 12, face = "bold")
+  )
+  )
+
+time_plot_treatment_comp
+```
+
+### 2.7.3 Save figure
+
+Export the treatment-faceted plot as a high-resolution PNG for use in the manuscript as Figure 2.
+
+```{r}
+ggsave(
+  filename = "5-figs/time_plot_treatment_comp.png", 
+  plot = time_plot_treatment_comp, 
+  width = 6, 
+  height = 4, 
+  dpi = 300 
+)
+```
+
+# 3. Analysis — Accuracy
+
+We now model accuracy, measured as the number of incorrect entries made before successfully navigating the maze. Because this response is a non-negative count with many zeros and overdispersion, we proceed from a Poisson baseline to increasingly flexible negative-binomial and zero-inflated specifications. As with solve time, we allow fish-level learning (random slopes for trial) and consider censoring to retain non-finishing trials.
+
+## 3.1 Model 1 — Baseline Poisson with individual intercepts and learning slopes
+
+We begin with a Poisson regression as a baseline. Individual intercepts and learning slopes are included to account for heterogeneity in baseline accuracy and improvement across trials.
+
+### 3.1.1 Model specification
+
+The baseline model assumes incorrect entries follow a Poisson distribution with a log link. Fixed effects include the full trial × treatment × sex interaction, plus orientation, scaled standard length, and batch. Random intercepts and slopes for trial are fitted per individual to capture heterogeneity in baseline accuracy and learning rates.
+
+```{r}
+accuracy_model_formula1 <- bf(
+  incorrect_entries ~ 1 +
+  trial*treatment*sex + 
+  orientation + 
+  scaled_std_length + 
+  batch +
+  (1 + trial | individual_ID),
+  family = poisson()
+)
+```
+
+### 3.1.2 Specifying priors
+
+#### 3.1.2.1 Inspecting priors
+
+Default priors are listed to identify any flat/vague components before setting weakly informative alternatives.
+
+```{r}
+get_prior(accuracy_model_formula1, data = df)
+```
+
+Consistent with earlier sections, we do not expect fixed effects to produce >10× multiplicative changes on the count scale. On the log scale, this corresponds to roughly −2.30 to +2.30, so we use Normal(0, 2) for coefficients as a weakly informative effect-size prior.
+
+#### 3.1.2.2 Setting priors
+
+Priors mirror those used for the time models, adapted to the Poisson family.
+
+```{r}
+priors2 <- c(
+  set_prior("normal(0,2)", class = "b"), 
+  set_prior("student_t(3, 0, 2.5)", class = "Intercept"), 
+  set_prior("student_t(3, 0, 2.5)", class = "sd", lb = 0)
+)
+```
+
+### 3.1.3 Fit Model 1
+
+This chunk fits the Poisson model using the priors above. Computational controls (iterations, warmup, adapt_delta, etc.) mirror those of the solve-time models to ensure comparability.
+
+```{r}
+accuracy_model1 <- brm(accuracy_model_formula1,
+  prior = priors2,
+  data = df_nonachievers_rm,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr', 
+  file = "./4-models/accuracy_model1",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model1)
+```
+
+### 3.1.4 Model diagnostics
+
+Here we check convergence, prior-sensitivity, and predictive checks for the Poisson distributed accuracy model.
+
+#### 3.1.4.1 Chain convergence
+
+Traceplots are examined to verify good chain mixing and convergence.
+
+```{r}
+plot(accuracy_model1, ask = FALSE)
+```
+
+#### 3.1.4.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions
+
+```{r}
+plot(hypothesis(accuracy_model1, "sexF > 0"))
+plot(hypothesis(accuracy_model1, "orientationR > 0"))
+plot(hypothesis(accuracy_model1, "treatmenth > 0"))
+plot(hypothesis(accuracy_model1, "trial > 0"))
+```
+
+#### 3.1.4.3 Posterior predictive checks
+
+Posterior predictive checks are used to evaluate whether the Poisson model captures the observed distribution of incorrect entries.
+
+```{r}
+pp_check(accuracy_model1)
+pp_check(accuracy_model1, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model1, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model1, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+```
+
+Results show clear underestimation of variance, reflecting Poisson’s equidispersion assumption. This motivates moving to a negative-binomial model.
+
+## 3.2 Model 2 — Negative binomial to address overdispersion
+
+The Poisson model systematically underestimates variance in incorrect entries, reflecting overdispersion in the data. To resolve this, we extend the baseline model to a negative-binomial, which introduces a dispersion parameter while retaining the same fixed and random effects structure.
+
+### 3.2.1 Model specification
+
+Here we replace the Poisson likelihood with a negative-binomial. Fixed and random effects remain identical to Model 1.
+
+```{r}
+accuracy_model_formula2 <- bf(
+  incorrect_entries ~ 1 +
+  trial*treatment*sex + 
+  orientation + 
+  scaled_std_length + 
+  batch +
+  (1 + trial | individual_ID),
+  family = negbinomial()
+)
+```
+
+### 3.2.2 Specifying priors
+
+Again, the negative binomial is log linked, and so we will use the same priors as for all previous models but this time the variance parameter is "shape' as oppossed to "sigma", so we will have to create a new prior list to specify this parameters default prior.
+
+#### 3.2.2.1 Inspecting priors
+
+We check the default priors for the negative-binomial, particularly for the shape parameter that controls overdispersion.
+
+```{r}
+get_prior(accuracy_model_formula2, data = df)
+```
+
+#### 3.2.2.2 Setting priors
+
+Priors for coefficients mirror Model 1. The negative-binomial’s dispersion parameter appears as "shape" (larger -> less overdispersion).
+
+```{r}
+priors3 <- c(
+  set_prior("normal(0,2)", class = "b"),
+  set_prior("student_t(3, 0, 2.5)", class = "Intercept"),
+  set_prior("student_t(3, 0, 2.5)", class = "sd", lb = 0),
+  set_prior("inv_gamma(0.4, 0.3)", class = "shape", lb = 0)
+)
+```
+
+### 3.2.3 Fit Model 2
+
+The negative-binomial model is fitted with the specified priors.
+
+```{r}
+accuracy_model2 <- brm(accuracy_model_formula2, 
+  prior = priors3,
+  data = df_nonachievers_rm,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/accuracy_model2",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model2)
+```
+
+### 3.2.4 Model diagnostics
+
+We repeat convergence, prior-sensitivity, and predictive checks for the negative-binomial to verify it addresses the variance underestimation seen in the Poisson model.
+
+#### 3.2.4.1 Chain convergence
+
+Traceplots are examined to verify good chain mixing and convergence.
+
+```{r}
+plot(accuracy_model2, ask = FALSE)
+```
+
+#### 3.2.4.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions
+
+```{r}
+plot(hypothesis(accuracy_model2, "sexF > 0"))
+plot(hypothesis(accuracy_model2, "orientationR > 0"))
+plot(hypothesis(accuracy_model2, "treatmenth > 0"))
+plot(hypothesis(accuracy_model2, "trial > 0"))
+```
+
+#### 3.2.4.3 Posterior predictive checks
+
+Posterior predictive checks show improved fit compared to the Poisson, but a little bit of variance underestimation remains.
+
+```{r}
+pp_check(accuracy_model2)
+pp_check(accuracy_model2, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model2, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model2, type = "stat_grouped", group = "trial", stat = "sd")
+pp_check(accuracy_model2, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+```
+
+### 3.2.5 Model comparison using LOOIC
+
+Models 1 and 2 are compared with leave-one-out cross-validation.
+
+```{r}
+accuracy_model1 <- add_criterion(accuracy_model1, criterion = "loo")
+accuracy_model2 <- add_criterion(accuracy_model2, criterion = "loo")
+
+loo_compare(accuracy_model1, accuracy_model2)
+```
+
+The negative-binomial provides a better fit than Poisson, confirming the importance of handling overdispersion.
+
+## 3.3 Model 3 — Zero-inflated negative binomial
+
+Even the negative-binomial fails to fully capture the large spike of zero incorrect entries, where fish solve the maze perfectly. To address this, we fit a zero-inflated negative-binomial (ZINB), which models zeros as arising from two processes: “structural zeros” (fish that truly never make an error) and “sampling zeros” from the negative-binomial. This structure provides the most flexible and realistic representation of accuracy.
+
+### 3.3.1 Model specification
+
+Because ~30% of trials recorded zero incorrect entries, we extend the model to a zero-inflated negative binomial (ZINB). This distinguishes between “true” zero errors and structural zeros (fish that never entered incorrectly).
+
+```{r}
+accuracy_model_formula3 <- bf(
+  incorrect_entries ~ 1 +
+  trial*treatment*sex + 
+  orientation + 
+  scaled_std_length + 
+  batch +
+  (1 + trial | individual_ID),
+  family = zero_inflated_negbinomial()
+)
+```
+
+###3.3.2 Specifying priors
+
+We set weakly informative priors for the mean, whilst maintaining the defaults for dispersion (shape), and zero-inflation (zi) parts of the ZINB.
+
+####3.3.2.1 Inspecting priors
+
+We list default priors to check those applying to the shape (dispersion) and zi (zero-inflation) parameters.
+
+```{r}
+get_prior(accuracy_model_formula3, data = df)
+```
+
+### 3.3.2.2 Setting priors
+
+Weakly informative priors are applied to regression coefficients, intercepts, random effects, dispersion (shape), and zero-inflation (zi).
+
+```{r}
+priors4 <- c(
+  set_prior("normal(0,2)", class = "b"), 
+  set_prior("student_t(3, 0, 2.5)", class = "Intercept"),
+  set_prior("student_t(3, 0, 2.5)", class = "sd", lb = 0),
+  set_prior("gamma(0.01, 0.01)", class = "shape", lb = 0),
+  set_prior("beta(1, 1)", class = "zi", lb = 0, ub = 1)
+)
+```
+
+### 3.3.3 Fit Model 3
+
+The zero-inflated negative-binomial is fitted to the dataset with the priors specified above.
+
+```{r}
+accuracy_model3 <- brm(accuracy_model_formula3,
+  prior = priors4,
+  data = df_nonachievers_rm, 
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/accuracy_model3",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model3)
+```
+
+### 3.3.4 Model diagnostics
+
+We assess mixing and fit for the ZINB, focusing on whether the model captures both the spike at zero and the heavy right tail across trials.
+
+#### 3.3.4.1 Chain convergence
+
+Traceplots are examined to verify good chain mixing and convergence.
+
+```{r}
+plot(accuracy_model3, ask = FALSE)
+```
+
+#### 3.3.4.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions
+
+```{r}
+plot(hypothesis(accuracy_model3, "sexF > 0"))
+plot(hypothesis(accuracy_model3, "orientationR > 0"))
+plot(hypothesis(accuracy_model3, "treatmenth > 0"))
+plot(hypothesis(accuracy_model3, "trial > 0"))
+```
+
+#### 3.3.4.3 Posterior predictive checks
+
+Posterior predictive checks are used to assess whether the ZINB model reproduces observed data distributions and trial-level means.
+
+```{r}
+pp_check(accuracy_model3)
+pp_check(accuracy_model3, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model3, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model3, type = "stat_grouped", group = "trial", stat = "sd")
+pp_check(accuracy_model3, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+```
+
+### 3.3.5 Model comparison using LOOIC
+
+All three models are compared via LOOIC to assess predictive performance.
+
+```{r}
+accuracy_model3 <- add_criterion(accuracy_model3, criterion = "loo")
+
+loo_compare(accuracy_model1, accuracy_model2, accuracy_model3)
+```
+
+This model is no different than model 2, it is still much better than the poisson model, but it still just underestimates variance. Currently all the models have assumed that the shape parameter (variance) is constant. However, it is feasible that it may vary between sexes (ref) and it is also likely that it varies across trials.
+
+## 3.4 Model 4 — Negative binomial with shape varying
+
+We now allow the dispersion (shape) to vary with key predictors. This addresses patterns where variability differs across trials or between treatments/sexes.
+
+### 3.4.1 Model specification
+
+The mean submodel mirrors earlier negative binomial models. The shape submodel includes an additive effect of trial, treatment, and sex.
+
+```{r}
+accuracy_model_formula4 <- bf(
+  incorrect_entries ~ 1 +
+  trial*treatment*sex + 
+  orientation + 
+  scaled_std_length + 
+  batch +
+  (1 + trial | individual_ID),
+  shape ~ 1 + trial + treatment + sex + (1 | individual_ID),
+  family = negbinomial()
+)
+```
+
+### 3.4.2 Specifying priors
+
+#### 3.4.2.1 Inspecting priors
+
+We list and review default priors for both the mean and dispersion (shape) submodels.
+
+```{r}
+get_prior(accuracy_model_formula4, data = df)
+```
+
+#### 3.4.2.2 Setting priors
+
+We use the same weakly informative priors for the mean submodel and retain default priors for the shape submodel coefficients.
+
+```{r}
+priors5 <- c(
+  set_prior("normal(0,2)", class = "b"),
+  set_prior("student_t(3, 0, 2.5)", class = "Intercept"),
+  set_prior("student_t(3, 0, 2.5)", class = "sd", lb = 0)
+)
+```
+
+
+### 3.4.3 Fit Model 4
+
+This chunk fits the distributional negative-binomial in which the mean is modeled as before and the dispersion (shape) varies by trial, treatment, and sex. Sampler controls mirror earlier fits to keep results comparable.
+
+```{r}
+accuracy_model4 <- brm(accuracy_model_formula4, 
+  prior = priors5,
+  data = df_nonachievers_rm, 
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/accuracy_model4",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model4)
+```
+
+### 3.4.4 Model diagnostics
+
+Here we check convergence, prior-sensitivity, and predictive checks for the negative binomial model with varying shape.
+
+#### 3.4.4.1 Chain convergence
+
+Traceplots are examined to verify good chain mixing and convergence.
+
+```{r}
+plot(accuracy_model4, ask = FALSE)
+```
+
+#### 3.4.4.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions
+
+```{r}
+plot(hypothesis(accuracy_model4, "sexF > 0"))
+plot(hypothesis(accuracy_model4, "orientationR > 0"))
+plot(hypothesis(accuracy_model4, "treatmenth > 0"))
+plot(hypothesis(accuracy_model4, "trial > 0"))
+```
+
+#### 3.4.4.3 Posterior predictive checks
+
+We compare grouped means and standard deviations and inspect distribution overlays to confirm the varying shape component improves variance fit relative to simpler models.
+
+```{r}
+pp_check(accuracy_model4)
+pp_check(accuracy_model4, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model4, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model4, type = "stat_grouped", group = "trial", stat = "sd")
+pp_check(accuracy_model4, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+```
+
+### 3.4.5 Model comparison using LOOIC
+
+We add LOO criteria to each candidate and compare expected out-of-sample performance; lower LOOIC indicates a better predictive model.
+
+```{r}
+accuracy_model4 <- add_criterion(accuracy_model4, criterion = "loo")
+loo_compare(accuracy_model1, accuracy_model2, accuracy_model3, accuracy_model4)
+```
+
+## 3.5 Model 5 — Negative binomial with individual random effects on shape
+
+To allow between-fish differences in dispersion, we further extend the shape submodel to include a random intercept for individual_ID. This recognises that some fish are more variable than others.
+
+### 3.5.1 Model specification
+
+We extend the shape submodel by adding a random intercept for individual_ID, allowing among-fish differences in dispersion while retaining random intercepts and trial slopes for the mean model.
+
+```{r}
+accuracy_model_formula5 <- bf(
+  incorrect_entries ~ 1 +
+  trial*treatment*sex + 
+  orientation + 
+  scaled_std_length + 
+  batch +
+  (1 + trial | individual_ID),
+  shape ~ 1 + trial + treatment*sex + (1 | individual_ID),
+  family = negbinomial()
+)
+```
+
+
+### 3.5.2 Fit Model 5
+
+This step fits the extended distributional negative binomial with the new shape random effect using the same weakly informative priors and sampler settings for a fair comparison.
+
+```{r}
+accuracy_model5 <- brm(accuracy_model_formula5, 
+  prior = priors5,
+  data = df_nonachievers_rm, 
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/accuracy_model5",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model5)
+```
+
+### 3.5.3 Model diagnostics
+
+As before, we review convergence, prior influence, and predictive adequacy for the model with individual-level dispersion to ensure stable fish-specific variability estimates.
+
+#### 3.5.3.1 Chain convergence
+
+Traceplots are examined to verify good chain mixing and convergence.
+
+```{r}
+plot(accuracy_model5, ask = FALSE)
+```
+
+#### 3.5.3.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions
+
+```{r}
+plot(hypothesis(accuracy_model5, "sexF > 0"))
+plot(hypothesis(accuracy_model5, "orientationR > 0"))
+plot(hypothesis(accuracy_model5, "treatmenth > 0"))
+plot(hypothesis(accuracy_model5, "trial > 0"))
+```
+
+#### 3.5.3.3 Posterior predictive checks
+
+Posterior predictive checks are used to assess whether the model reproduces observed data distributions and trial-level means.
+
+```{r}
+pp_check(accuracy_model5)
+pp_check(accuracy_model5, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model4, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model5, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model4, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model5, type = "stat_grouped", group = "trial", stat = "sd")
+pp_check(accuracy_model5, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+```
+
+### 3.5.4 Model comparison using LOOIC
+
+We compare Models 1–5 via LOO to quantify the value of allowing individual-level dispersion in addition to varying means.
+
+```{r}
+accuracy_model5 <- add_criterion(accuracy_model5, criterion = "loo")
+loo_compare(accuracy_model1, accuracy_model2, accuracy_model3, accuracy_model4, accuracy_model5)
+```
+
+## 3.6 Model 6 — Distributional negative binomial with censored datapoints
+
+Finally, we retain non-finishing trials by using the censored data set and applying the distributional negative binomial specification that let shape vary with trial, treatment, and sex. This provides inferences from the full dataset.
+
+### 3.6.1 Model specification
+
+We apply the distributional negative binomial structure to the full (censored) dataset by modeling incorrect_entries | cens(cens) and allowing shape to vary with trial, treatment, and sex.
+
+```{r}
+accuracy_model_formula6 <- bf(
+  incorrect_entries | cens(cens) ~ 1 +
+  trial*treatment*sex + 
+  orientation + 
+  scaled_std_length + 
+  batch +
+  (1 + trial | individual_ID),
+  shape ~ 1 + trial + treatment*sex + (1 | individual_ID),
+  family = negbinomial()
+)
+```
+
+
+### 3.6.2 Fit Model 6
+
+This chunk fits the censored distributional negative binomial with the informed prior set (priors5) and identical computational controls so improvements reflect model structure rather than tuning differences.
+
+```{r}
+accuracy_model6 <- brm(accuracy_model_formula6,
+  prior = priors5,
+  data = df_complete,
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  iter = 6000, warmup = 4000,
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/accuracy_model6",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model6)
+```
+
+### 3.6.3 Model diagnostics
+
+We run the full diagnostic suite for the final censored distributional model—convergence, prior vs. posterior shifts, and pp_checks—to verify its performance and fit.
+
+#### 3.6.3.1 Chain convergence
+
+Traceplots are examined to verify good chain mixing and convergence.
+
+```{r}
+plot(accuracy_model6, ask = FALSE)
+```
+
+#### 3.6.3.2 Prior diagnostics
+
+Posterior distributions are compared against priors to ensure results are not driven by prior assumptions
+
+```{r}
+plot(hypothesis(accuracy_model6, "sexF > 0"))
+plot(hypothesis(accuracy_model6, "orientationR > 0"))
+plot(hypothesis(accuracy_model6, "treatmenth > 0"))
+plot(hypothesis(accuracy_model6, "trial > 0"))
+```
+
+#### 3.6.3.3 Posterior predictive checks
+
+Posterior predictive checks are used to assess whether the censored model reproduces observed data distributions and trial-level means.
+
+```{r}
+pp_check(accuracy_model6)
+pp_check(accuracy_model6, type = "stat_2d", ndraws = 100)
+pp_check(accuracy_model6, type = "stat_grouped", group = "trial", stat = "mean")
+pp_check(accuracy_model6, type = "stat_grouped", group = "trial", stat = "sd")
+pp_check(accuracy_model6, ndraws = 100, type = 'ecdf_overlay') + xlim(0, 750)
+```
+
+Model 6 fits the best and so we will proceed with this model to inform inference 
+
+```{r}
+accuracy_model <- accuracy_model6
+```
+
+## 3.7 Influence of priors
+
+To check that inferences are data-driven (not prior-driven), we refit the final model with default diffuse priors (“flat” with respect to brms defaults for the given family) and compare posterior summaries and predictive fit with the informed-prior model.
+
+### 3.7.1 Flat prior model
+
+This chunk refits the chosen model structure (censored negative binomial with a varying shape parameter) without the weakly informative priors used earlier. Computational controls are held constant so differences reflect prior specification rather than sampler settings.
+
+```{r}
+accuracy_model_nopriors <- brm(accuracy_model_formula6,
+  data = df_complete,
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  iter = 6000, warmup = 4000,
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  file = "./4-models/accuracy_model_nopriors",
+  init = 0,
+  seed = 1)
+
+summary(accuracy_model_nopriors)
+```
+
+
+### 3.7.2 Influence of priors
+
+Here we:
+- Extract posterior draws for all fixed-effect coefficients from both fits,
+- Visualise coefficient-wise density overlays to spot any prior-induced shrinkage, and
+- Compare out-of-sample fit using LOO.
+
+```{r}
+draws_informed <- as_draws_df(accuracy_model)
+draws_flat <- as_draws_df(accuracy_model_nopriors)
+
+all_b <- grep("^b_", colnames(draws_informed), value = TRUE)
+
+post_inf <- draws_informed |>
+  select(all_of(all_b)) |>
+  pivot_longer(everything(),
+  names_to = "parameter",
+  values_to = "value") |>
+  mutate(model = "informed")
+
+post_flat <- draws_flat |>
+  dplyr::select(all_of(all_b)) |>
+  pivot_longer(everything(),
+  names_to = "parameter",
+  values_to = "value") |>
+  mutate(model = "no_priors")
+
+bind_rows(post_inf, post_flat) |>
+  ggplot(aes(x = value, fill = model)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ parameter, scales = "free") +
+  labs(
+  title = "Posterior densities: informed priors vs no priors",
+  x = "Coefficient value",
+  y = "Density"
+  ) +
+  theme_minimal()
+
+accuracy_model <- add_criterion(accuracy_model, criterion = "loo")
+accuracy_model_nopriors <- add_criterion(accuracy_model_nopriors, criterion = "loo")
+
+loo_compare(accuracy_model, accuracy_model_nopriors)
+```
+
+## 3.8 Mean effects
+
+### 3.8.1 Model summary
+
+This chunk prints the standard brms summary (fixed effects, random-effects SDs/correlations) and two measures of explained variance: Bayesian R² (in-sample) and LOO-R² (approximate out-of-sample). These provide complementary views of fit quality for a lognormal, censored response.
+
+```{r}
+summary(accuracy_model)
+bayes_R2(accuracy_model)
+loo_R2(accuracy_model)
+```
+
+### 3.8.2 Learning rate differnces
+
+We quantify learning slopes (change in accuracy per trial) for each combination of treatment and sex.
+
+#### 3.8.2.1 Predictor effect estimates and contrasts of learning rate
+
+We use emtrends() to estimate the population-level learning rate (seconds / trial) by treatment × sex, marginalizing over other predictors and excluding random effects (re_formula = NA). Pairwise contrasts of these learning rates are computed with "revpairwise".
+
+```{r}
+marginal_estimates_and_contrasts_accuracymodel <- emtrends(accuracy_model,"revpairwise" ~ treatment + sex, var = "trial", epred = TRUE, re_formula = NA)
+marginal_estimates_and_contrasts_accuracymodel
+```
+
+There appears to a lot of differences between different sexes and treatments when it comes to the rate of reducing inaccuracies during the solve. Let's explore them in more detail.
+
+#### 3.8.2.2 Visualisation of learning rate contrasts
+
+We convert emtrends() results to draws and plot densities of trial-slope contrasts. Shaded regions near zero help assess practical equivalence; wide overlap with zero implies negligible differences.
+
+```{r}
+contrast_vis_accuracy_model_draws <- emtrends(accuracy_model,"revpairwise" ~ treatment + sex, var = "trial", epred = TRUE, re_formula = NA) |> 
+  gather_emmeans_draws() |> 
+  dplyr::filter(contrast %in% c("l M - c M", 
+  "h M - c M", 
+  "h M - l M", 
+  "h F - l F", 
+  "l F - c F", 
+  "h F - c F", 
+  "l F - l M", 
+  "h F - h M", 
+  "c F - c M"))
+
+ggplot(contrast_vis_accuracy_model_draws, aes(x = contrast, y = .value)) +
+  stat_halfeye() +
+  geom_hline(yintercept = 0) +
+  coord_flip()+
+  theme_classic()
+```
+
+
+
+### 3.8.3 Absolute solve time differences
+
+Compute marginal mean solve times for each treatment × sex combination in each trial. Test pairwise contrasts to compare which groups solve faster at each stage.
+
+#### 3.8.3.1 Predictor effect estimates and contrasts of solve times
+
+This reports the average estimate for each trial and also a table with the contrasts of the absolute accuracy contrasted between all permutations of sex and treatment across trials.
+
+```{r}
+accuracy_model_contrasts <- accuracy_model |> 
+  emmeans( "revpairwise" ~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA)
+
+accuracy_model |> 
+  emmeans(~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA)
+
+accuracy_filtered_contrasts <- as.data.frame(accuracy_model_contrasts$contrasts) |>
+  dplyr::filter(contrast %in% c("l M - c M", 
+  "h M - c M", 
+  "h M - l M", 
+  "h F - l F", 
+  "l F - c F", 
+  "h F - c F", 
+  "l F - l M", 
+  "h F - h M", 
+  "c F - c M")) |>
+  dplyr::select(trial, contrast, estimate, lower.HPD, upper.HPD)
+
+kable(accuracy_filtered_contrasts, digits = 2, 
+  col.names = c("Trial", "Contrast", "Estimate", "Lower HPD", "Upper HPD"),
+  caption = "Bayesian Contrast Estimates with 95% HPD Intervals",
+  format = "html",
+  table.attr = 'style="color: white; font-family: Arial, sans-serif;"')
+```
+
+#### 3.8.3.2 Visualisation of solve time contrasts
+
+```{r}
+accuracy_model_draws <- accuracy_model |> 
+  emmeans( "revpairwise" ~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA) |>
+  gather_emmeans_draws()
+
+accuracy_model_contrast_draws <- accuracy_model_draws |> 
+  dplyr::filter(contrast %in% c("h M - l M", "l M - c M", "h M - c M", "h F - l F", "l F - c F", "h F - c F", "l F - l M", "h F - h M", "c F - c M"))
+
+accuracy_model_contrast_draws <- accuracy_model_contrast_draws |> 
+  mutate(contrast = factor(contrast, levels = c("l M - c M", 
+  "h M - c M", 
+  "h M - l M", 
+  "h F - l F", 
+  "l F - c F", 
+  "h F - c F", 
+  "l F - l M", 
+  "h F - h M", 
+  "c F - c M")),
+  treatment = factor(treatment, levels = c("c", "l", "h")))
+
+accuracy_model_estimate_draws <- accuracy_model_draws |> 
+  dplyr::filter(!is.na(treatment)) |> 
+  dplyr::mutate(treatment = factor(treatment, levels=c("c", "l", "h")))
+
+ggplot(dplyr::filter(accuracy_model_contrast_draws, contrast %in% c("h M - l M", "l M - c M", "h M - c M")), aes(x = contrast, y = .value, color = trial)) +
+  stat_halfeye(aes(group = trial), position = position_dodge()) +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  labs(title = "Contrasts of treatments within Sex 1",
+  x = "Treatment contrast and trial number",
+  y = "Marginal difference in seconds"
+  )+
+  coord_cartesian(ylim = c(-3, 3))
+
+ggplot(dplyr::filter(accuracy_model_contrast_draws, contrast %in% c("h F - l F", "l F - c F", "h F - c F")), aes(x = contrast, y = .value, color = trial)) +
+  stat_halfeye(aes(group = trial), position = position_dodge()) +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  labs(title = "Contrasts of treatments within Sex 2",
+  x = "Treatment contrast and trial number",
+  y = "Marginal difference in seconds"
+  )+
+  coord_cartesian(ylim = c(-3, 3))
+
+ggplot(dplyr::filter(accuracy_model_contrast_draws, contrast %in% c("l F - l M", "h F - h M", "c F - c M")), aes(x = contrast, y = .value, color = trial)) +
+  stat_halfeye(aes(group = trial), position = position_dodge()) +
+  geom_hline(yintercept = 0) +
+  theme_classic() +
+  labs(title = "Contrasts of sexes across treatments",
+  x = "Treatment contrast and trial number",
+  y = "Marginal difference in seconds"
+  ) +
+  coord_cartesian(ylim = c(-3, 3))
+
+
+accuracy_significant_regions <- accuracy_model_contrast_draws |>
+  group_by(contrast, trial) |>
+  summarize(
+  lower = quantile(.value, 0.025),
+  upper = quantile(.value, 0.975),
+  .groups = "drop"
+  ) |>
+  mutate(
+  significant = (lower > 0) | (upper < 0),
+  xmin = ifelse(trial == 1, trial - 0.2, trial - 0.5),
+  xmax = ifelse(trial == 12, trial + 0.2, trial + 0.5),
+  ymin = -Inf,
+  ymax = Inf
+  ) |>
+  filter(significant == TRUE)
+
+accuracy_contrast_plot <- ggplot() +
+  geom_rect(data = accuracy_significant_regions, 
+  aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+  fill = "gray", alpha = 0.5) +
+  stat_lineribbon(data = accuracy_model_contrast_draws, aes(x = trial, y = .value, fill = stat(level))) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 0.3) +
+  scale_fill_brewer() +
+  theme_classic() +
+  coord_cartesian(xlim = c(1, 12))+
+  scale_x_continuous(
+  breaks = seq(1, 12, by = 1), 
+  labels = seq(1, 12, by = 1)) +
+  theme(legend.position = "none") +
+  facet_wrap(~contrast)
+
+accuracy_contrast_plot
+```
+
+#### 3.8.3.3 Average marginal effects (AME) and contrasts
+
+```{r}
+newdata <- df_complete |>
+  distinct(sex, trial, individual_ID, orientation, scaled_std_length, batch) |>
+  crossing(treatment = c("c", "l", "h"))
+
+epred_draws <- add_epred_draws(
+  object = accuracy_model,
+  newdata = newdata,
+  re_formula = NA,
+  ndraws = 8000
+)
+
+ame_draws <- epred_draws |>
+  group_by(.draw, sex, treatment) |>
+  summarise(mean_epred = mean(.epred, na.rm = TRUE), .groups = "drop")
+
+ame_contrast_draws <- ame_draws |>
+  pivot_wider(names_from = treatment, values_from = mean_epred) |>
+  mutate(
+  abs_l_minus_c = l - c,
+  abs_h_minus_c = h - c,
+  abs_h_minus_l = h - l,
+  pct_l_minus_c = 100 * (abs_l_minus_c / c),
+  pct_h_minus_c = 100 * (abs_h_minus_c / c),
+  pct_h_minus_l = 100 * (abs_h_minus_l / l)
+  ) |>
+  pivot_longer(
+  cols = c(starts_with("abs_"), starts_with("pct_")),
+  names_to = "contrast_type",
+  values_to = "value"
+  ) |>
+  mutate(
+  contrast = case_when(
+  str_detect(contrast_type, "l_minus_c") ~ "l - c",
+  str_detect(contrast_type, "h_minus_c") ~ "h - c",
+  str_detect(contrast_type, "h_minus_l") ~ "h - l",
+  TRUE ~ NA_character_
+  ),
+  scale = ifelse(str_starts(contrast_type, "pct"), "percent", "absolute")
+  ) |>
+  drop_na(contrast)
+
+ame_contrast_summary <- ame_contrast_draws |>
+  group_by(sex, contrast, scale) |>
+  mean_qi(value)
+
+ame_contrast_summary_wide <- ame_contrast_summary |>
+  pivot_wider(
+  names_from = scale,
+  values_from = c(value, .lower, .upper),
+  names_glue = "{scale}_{.value}"
+  )
+
+ame_point_estimates <- ame_draws |>
+  group_by(sex, treatment) |>
+  mean_qi(mean_epred)
+
+sex_contrast_draws <- ame_draws |>
+  pivot_wider(
+  names_from = sex,
+  values_from = mean_epred) |>
+  mutate(
+  abs_male_minus_female = M - F,
+  pct_male_vs_female = 100 * (abs_male_minus_female / F)) |>
+  pivot_longer(
+  cols = c(starts_with("abs_"), starts_with("pct_")),
+  names_to = "contrast_type",
+  values_to = "value") |>
+  mutate(
+  contrast = "male - female",
+  scale = ifelse(str_starts(contrast_type, "pct"), "percent", "absolute"))
+
+sex_contrast_summary <- sex_contrast_draws |>
+  group_by(treatment, contrast, scale) |>
+  mean_qi(value)
+
+sex_contrast_summary_wide <- sex_contrast_summary |>
+  pivot_wider(
+  names_from = scale,
+  values_from = c(value, .lower, .upper),
+  names_glue = "{scale}_{.value}"
+  )
+
+ame_point_estimates
+ame_contrast_summary_wide
+sex_contrast_summary_wide
+```
+
+Here is a way of doing this using the marginaleffects package instead of performing AME by hand
+```{r}
+ame_contrast_summary <- avg_comparisons(
+  accuracy_model,
+  variables = list(treatment = "revpairwise"),
+  by = "sex",
+  re_formula = NA,
+  type = "response"
+)
+
+sex_contrast_summary <- avg_comparisons(
+  accuracy_model,
+  variables = list(sex = "revpairwise"),
+  by = "treatment",
+  re_formula = NA,
+  type = "response"
+)
+sex_contrast_summary
+ame_contrast_summary
+```
+
+####3.8.3.4 Visualisation of AME and contrasts
+
+```{r}
+ggplot(ame_draws, aes(x = treatment, y = mean_epred, fill = treatment)) +
+  stat_halfeye(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~sex) +
+  theme_classic()
+
+ggplot(ame_contrast_draws |> dplyr::filter(scale == "absolute"), aes(x = contrast, y = value)) +
+  stat_halfeye(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~sex) +
+  theme_classic()
+
+ggplot(sex_contrast_draws |> filter(scale == "absolute"), aes(x = treatment, y = value, fill = treatment)) +
+  stat_halfeye(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~ contrast) +
+  labs(
+  y = "Male − Female",
+  title = "Sex difference within each treatment"
+  ) +
+  theme_classic()
+```
+
+#### 3.8.3.5 Covariate effects on acccuracy
+
+These estimate marginal differences in solve time by orientation, batch, and body size 
+
+```{r}
+accuracy_orientation_table <- accuracy_model |>
+  emmeans(~ orientation, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  transmute(
+  Variable = "Orientation",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+
+accuracy_batch_table <- accuracy_model |>
+  emmeans(~ batch, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  transmute(
+  Variable = "Batch",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+
+accuracy_length_table <- accuracy_model |>
+  emtrends(~ 1, var = "scaled_std_length", epred = TRUE, re_formula = NA) |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  transmute(
+  Variable = "Body size (scaled)",
+  `Contrast (for factors)` = "-",
+  `Trend (for covariates)` = "Per +1 SD in length",
+  Estimate = scaled_std_length.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+
+accuracy_covariate_table <- bind_rows(accuracy_orientation_table, accuracy_batch_table, accuracy_length_table) |>
+  mutate(across(c(Estimate, `Lower CrI`, `Upper CrI`), ~ round(.x, 2)))
+
+print(as.matrix(accuracy_covariate_table))
+```
+
+## 3.9 Plots 
+
+### 3.9.1 Accuracy plot by sex
+
+```{r}
+accuracy_sig_strips <- accuracy_significant_regions |>
+  filter(contrast %in% c("l F - l M", "c F - c M", "h F - h M")) |>
+  mutate(
+  treatment = factor(case_when(
+  contrast == "c F - c M" ~ "c",
+  contrast == "l F - l M" ~ "l",
+  contrast == "h F - h M" ~ "h"
+  ), levels = c("c","l","h")),
+  ymin_strip = 0.1,
+  ymax_strip = 0.3
+  )
+
+accuracy_plot_sex_comp_strips <- ggplot() +
+  geom_rect(
+  data = accuracy_sig_strips,
+  inherit.aes = FALSE,
+  aes(xmin = xmin, xmax = xmax,
+  ymin = ymin_strip, ymax = ymax_strip),
+  fill = "grey", alpha = 0.8
+  ) +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = incorrect_entries, color = sex),
+  fun = mean, geom = "point", size = 1, alpha = 0.8,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = incorrect_entries, color = sex),
+  fun.data = mean_sdl, fun.args = list(mult = 1),
+  geom = "errorbar", width = 0, alpha = 0.8,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_lineribbon(
+  data = accuracy_model_estimate_draws,
+  aes(x = trial, y = .value, color = sex, fill = sex),
+  .width = 0.95, alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = accuracy_model_estimate_draws,
+  aes(x = trial, y = .value, color = sex, fill = sex),
+  .width = 0
+  ) +
+  scale_x_continuous(breaks = 1:12) +
+  scale_y_continuous(
+  breaks = 0:10, 
+  labels = function(x) ifelse(x %in% c(0, 2,4,6,8, 10), as.character(x), "")
+  ) +
+  labs(x = "Trial Number", y = "Number of errors") +
+  scale_color_manual(values = c("#762a83", colour_male)) +
+  scale_fill_manual (values = c(colour_male, "#762a83")) +
+  theme_classic() +
+  coord_cartesian(ylim = c(0.54, 9)) +
+  facet_wrap(~ treatment)
+
+accuracy_plot_sex_comp_strips
+```
+
+### 3.9.2 Accuracy plot by treatment 
+
+```{r}
+accuracy_plot_treatment_comp <- ggplot() +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = incorrect_entries, color = treatment),
+  fun = mean,
+  geom = "point",
+  size = 1,
+  alpha = 0.8,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_summary(
+  data = df_complete,
+  aes(x = trial, y = incorrect_entries, color = treatment),
+  fun.data = mean_sdl,
+  fun.args = list(mult = 1),
+  geom = "errorbar",
+  width = 0,
+  alpha = 0.8,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_lineribbon(
+  data = accuracy_model_estimate_draws,
+  aes(x = trial, y = .value, color = treatment, fill = treatment),
+  .width = 0.95,
+  alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = accuracy_model_estimate_draws,
+  aes(x = trial, y = .value, color = treatment, fill = treatment),
+  .width = 0
+  ) +
+  scale_x_continuous(
+  breaks = 1:12,
+  labels = 1:12) +
+  scale_y_continuous(
+  breaks = 0:10, 
+  labels = function(x) ifelse(x %in% c(0, 2,4,6,8, 10), as.character(x), "")
+  ) +
+  labs(
+  x = "Trial Number",
+  y = "Number of errors",
+  color = "Treatment",
+  fill = "Treatment"
+  ) +
+  scale_color_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  scale_fill_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +
+  theme(
+  legend.title = element_text(size = 10),
+  legend.key.size = unit(0.6, "lines"),
+  legend.spacing.y = unit(0.2, "cm"),
+  legend.spacing.x = unit(0.2, "cm"),
+  legend.margin = margin(1, 1, 1, 1),
+  legend.position = c(1, 0.98),
+  legend.justification = c("right", "top"),
+  legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+  legend.key = element_rect(fill = "transparent", color = NA)
+  ) +
+  
+  coord_cartesian(ylim = c(0.4, 8.5)) +
+  ggh4x::facet_wrap2(
+  ~ sex,
+  labeller = as_labeller(c("F" = "Females", "M" = "Males")),
+  strip = ggh4x::strip_themed(
+  # background_x = ggh4x::elem_list_rect(fill = c(
+  # F = alpha(colour_female, 0.4),
+  # M = alpha(colour_male, 0.4)
+  # )),
+  text_x = ggh4x::elem_list_text(size = 12, face = "bold")
+  )
+  )
+
+accuracy_plot_treatment_comp
+```
+
+### 3.9.3 Save figure
+
+```{r}
+ggsave(
+  filename = "5-figs/accuracy_plot_treatment_comp.png", 
+  plot = accuracy_plot_treatment_comp, 
+  width = 6, 
+  height = 4, 
+  dpi = 300 
+)
+```
+
+## 3.10 Variance effecs (variance decomposition)
+
+### 3.10.1 Within-individual variance 
+
+#### 3.10.1.1 General trend
+
+```{r}
+emtrends(accuracy_model, ~ 1, var = "trial", dpar = "shape", re_formula = NA)
+```
+
+#### 3.10.1.2 Contrasts
+
+This chunk estimates within-individual variance in error rates (𝜇2/shape) under the negative binomial model. We first generate a balanced prediction grid across trials, orientation, and batch while fixing body size at its mean. Expected means (𝜇) and shape parameters are extracted from the posterior (population level, excluding random effects), and combined to compute overdispersion-driven variance. For each treatment × sex group, we average equally across nuisance covariates to obtain marginal within-individual variance. Finally, we derive posterior contrasts: (i) Control vs Low and Control vs High within each sex, and (ii) Male vs Female within each treatment. These summaries provide an interpretable measure of how treatments and sex affect residual variability around individual performance.
+
+```{r}
+trials_eq <- sort(unique(df_complete$trial))
+
+grid_equal <- expand_grid(
+  trial = trials_eq,
+  orientation = levels(df_complete$orientation),
+  batch = levels(df_complete$batch),
+  scaled_std_length = 0
+) 
+
+newd_eq <- grid_equal |>
+  crossing(
+  treatment = factor(c("c","l","h"), levels = levels(df_complete$treatment)),
+  sex = factor(c("M","F"), levels = levels(df_complete$sex))
+  )
+
+mu_eq <- posterior_epred(accuracy_model, newdata = newd_eq, re_formula = NA)
+shape_eq <- posterior_linpred(accuracy_model, dpar = "shape",
+  newdata = newd_eq, transform = TRUE, re_formula = NA)
+
+VW_eq_cols <- (mu_eq^2) / shape_eq 
+
+grp_eq <- interaction(newd_eq$treatment, newd_eq$sex, sep = ".") 
+idx_list <- split(seq_len(ncol(VW_eq_cols)), grp_eq)
+
+vw_group_draws_eq <- sapply(idx_list, function(cols) {
+  rowMeans(VW_eq_cols[, cols, drop = FALSE])
+})
+
+vw_df_eq <- as_tibble(vw_group_draws_eq) |>
+  dplyr::mutate(.draw = dplyr::row_number()) |>
+  pivot_longer(-.draw, names_to = "group", values_to = "VW") |>
+  separate(group, into = c("treatment","sex"), sep = "\\.") |>
+  dplyr::mutate(
+  treatment = factor(treatment, levels = c("c","l","h")),
+  sex = factor(sex, levels = c("M","F"))
+  )
+
+vw_wide_tx_eq <- vw_df_eq |>
+  pivot_wider(id_cols = c(.draw, sex), names_from = treatment, values_from = VW)
+
+vw_contrasts_tx_eq <- vw_wide_tx_eq |>
+  dplyr::transmute(
+  sex, .draw,
+  `c - l` = c - l,
+  `c - h` = c - h
+  ) |>
+  pivot_longer(c( `c - l` , `c - h`), names_to = "contrast", values_to = "diff") |>
+  dplyr::group_by(sex, contrast) |>
+  dplyr::summarise(
+  median = median(diff),
+  lower.CrI = quantile(diff, 0.025),
+  upper.CrI = quantile(diff, 0.975),
+  .groups = "drop"
+  )
+
+vw_wide_sex_eq <- vw_df_eq |>
+  pivot_wider(id_cols = c(.draw, treatment), names_from = sex, values_from = VW)
+
+vw_contrasts_sex_eq <- vw_wide_sex_eq |>
+  dplyr::transmute(treatment, .draw, contrast = "M - F", diff = M - F) |>
+  dplyr::group_by(treatment, contrast) |>
+  dplyr::summarise(
+  median = median(diff),
+  lower.CrI = quantile(diff, 0.025),
+  upper.CrI = quantile(diff, 0.975),
+  .groups = "drop"
+  )
+
+vw_df <- vw_df_eq
+vw_contrasts_tx <- vw_contrasts_tx_eq
+vw_contrasts_sex <- vw_contrasts_sex_eq
+
+vw_contrasts_tx
+vw_contrasts_sex
+```
+
+####3.10.1.3 Plot
+
+```{r}
+vw_df_plot <- vw_df |>
+  dplyr::mutate(
+  treatment_lab = factor(treatment, levels = c("c","l","h"),
+  labels = c("Control","Low","High"))
+  )
+
+within_sum <- vw_df_plot |>
+  dplyr::group_by(sex, treatment_lab) |>
+  dplyr::summarise(
+  median = median(VW),
+  lo95 = quantile(VW, 0.025),
+  hi95 = quantile(VW, 0.975),
+  .groups = "drop"
+  )
+
+within_plot <- ggplot(
+  within_sum,
+  aes(x = treatment_lab, y = median, ymin = lo95, ymax = hi95, color = treatment_lab)
+  ) +
+  geom_pointrange(size = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.3) +
+  facet_wrap(~ sex) +
+  scale_color_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  labs(
+  x = "Treatment",
+  y = expression(paste("Within-individual variance (", mu^2, "/shape)")),
+  color = "Treatment",
+  title = "Within-individual variance"
+  ) +
+  theme_classic(base_size = 12)
+
+within_plot
+```
+
+### 3.10.2 Among-individual variance 
+
+```{r}
+VarCorr(accuracy_model, summary = TRUE)
+dr <- as_draws_df(accuracy_model)
+vars <- colnames(dr)
+
+pick1 <- function(pattern) {
+  hits <- vars[grepl(pattern, vars, perl = TRUE)]
+  if (length(hits) != 1) {
+  stop(sprintf("Expected exactly 1 match for /%s/, got %d:\n%s",
+  pattern, length(hits), paste(hits, collapse = ", ")))
+  }
+  hits
+}
+
+v_sd_int <- pick1("^sd_(?!shape).*individual_ID__Intercept$") 
+v_sd_slope <- pick1("^sd_(?!shape).*individual_ID__trial$") 
+v_cor <- pick1("^cor_(?!shape).*individual_ID__Intercept__trial$") 
+
+re_draws <- dr %>%
+  select(all_of(c(v_sd_int, v_sd_slope, v_cor))) %>%
+  rename(
+  sd_intercept = !!v_sd_int,
+  sd_slope = !!v_sd_slope,
+  cor_int_slope = !!v_cor
+  )
+
+re_sum <- re_draws %>% median_qi(sd_intercept, sd_slope, cor_int_slope)
+re_sum
+```
+
+```{r}
+q <- re_draws |>
+  transmute(
+  q10_intercept = -qnorm(0.90) * sd_intercept,
+  q90_intercept = qnorm(0.90) * sd_intercept,
+  fold_baseline = exp(q90_intercept - q10_intercept),
+  q10_slope = -qnorm(0.90) * sd_slope,
+  q90_slope = qnorm(0.90) * sd_slope
+  )
+
+fold_baseline_sum <- q |> median_qi(fold_baseline)
+fold_baseline_sum
+```
+
+# 4. Tables and figures for the manuscript
+
+## 4.1 Figures
+
+```{r}
+time_plot_treatment_comp
+
+accuracy_plot_treatment_comp
+
+within_plot + among_plot +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+## 4.2 Results tables
+
+Here we bulk processing results tables for the manuscript and supplementary information. This includes rounding numeric values, replacing codes with descriptive text, and reordering columns. Then we save them all in one word doc.
+
+```{r}
+treat_levels <- c("c", "l", "h")
+sex_levels <- c("F", "M")
+
+round_df <- function(df, digits = 3) {
+  df |> dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits)))
+}
+
+replace_codes_vec <- function(x) {
+  x_chr <- as.character(x)
+  x_chr <- gsub("(?<![A-Za-z])M(?![A-Za-z])", "male", x_chr, perl = TRUE)
+  x_chr <- gsub("(?<![A-Za-z])F(?![A-Za-z])", "female", x_chr, perl = TRUE)
+  x_chr <- gsub("(?<![A-Za-z])l(?![A-Za-z])", "low", x_chr, perl = TRUE)
+  x_chr <- gsub("(?<![A-Za-z])c(?![A-Za-z])", "control", x_chr, perl = TRUE)
+  x_chr <- gsub("(?<![A-Za-z])h(?![A-Za-z])", "high", x_chr, perl = TRUE)
+  x_chr
+}
+
+apply_code_replacements <- function(df) {
+  df |> dplyr::mutate(dplyr::across(where(\(.x) is.character(.x) || is.factor(.x)), replace_codes_vec))
+}
+
+finish_tbl <- function(df) df |> round_df() |> apply_code_replacements()
+
+TableS1 <- as.data.frame(fixef(time_model, summary = TRUE)) |>
+  rownames_to_column("Parameter") |>
+  dplyr::rename(
+  Estimate = Estimate,
+  `Est. error` = Est.Error,
+  `Lower CrI` = Q2.5,
+  `Upper CrI` = Q97.5
+  ) |>
+  dplyr::relocate(Parameter, Estimate, `Est. error`, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS2 <- as.data.frame(time_model_contrasts$emmeans) |>
+  dplyr::mutate(
+  treatment = factor(treatment, levels = treat_levels),
+  sex = factor(sex, levels = sex_levels),
+  trial = as.integer(trial)
+  ) |>
+  dplyr::arrange(treatment, sex, trial) |>
+  dplyr::rename(
+  Treatment = treatment,
+  Sex = sex,
+  Trial = trial,
+  Estimate = emmean,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Treatment, Sex, Trial, Estimate, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS3 <- filtered_contrasts |>
+  dplyr::mutate(trial = as.integer(trial)) |>
+  dplyr::rename(
+  Trial = trial,
+  Contrast = contrast,
+  `Estimated difference` = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Trial, Contrast, `Estimated difference`, `Lower CrI`, `Upper CrI`) |>
+  dplyr::arrange(Trial, Contrast) |>
+  finish_tbl()
+
+TableS4 <- as.data.frame(marginal_estimates_and_contrasts_timemodel) |>
+  dplyr::filter(contrast == ".") |>
+  dplyr::mutate(
+  treatment = factor(treatment, levels = treat_levels),
+  sex = factor(sex, levels = sex_levels)
+  ) |>
+  dplyr::rename(
+  Treatment = treatment,
+  Sex = sex,
+  `Trend over trials` = trial.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Treatment, Sex, `Trend over trials`, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS5 <- as.data.frame(marginal_estimates_and_contrasts_timemodel) |>
+  dplyr::filter(contrast != ".") |>
+  dplyr::rename(
+  Contrast = contrast,
+  `Estimated difference in trend` = trial.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Contrast, `Estimated difference in trend`, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS6_covariates <- dplyr::bind_rows(
+  time_model |>
+  emmeans(~ orientation, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  dplyr::transmute(
+  Variable = "Orientation",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ),
+  time_model |>
+  emmeans(~ batch, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  dplyr::transmute(
+  Variable = "Batch",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ),
+  time_model |>
+  emtrends(~ 1, var = "scaled_std_length", epred = TRUE, re_formula = NA) |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  dplyr::transmute(
+  Variable = "Body size (scaled)",
+  `Contrast (for factors)` = "-",
+  `Trend (for covariates)` = "Per +1 SD in length",
+  Estimate = scaled_std_length.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+) |> finish_tbl()
+
+TableS7 <- as.data.frame(fixef(accuracy_model, summary = TRUE)) |>
+  rownames_to_column("Parameter") |>
+  dplyr::rename(
+  Estimate = Estimate,
+  `Est. error` = Est.Error,
+  `Lower CrI` = Q2.5,
+  `Upper CrI` = Q97.5
+  ) |>
+  dplyr::relocate(Parameter, Estimate, `Est. error`, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS8 <- as.data.frame(accuracy_model_contrasts$emmeans) |>
+  dplyr::mutate(
+  treatment = factor(treatment, levels = treat_levels),
+  sex = factor(sex, levels = sex_levels),
+  trial = as.integer(trial)
+  ) |>
+  dplyr::arrange(treatment, sex, trial) |>
+  dplyr::rename(
+  Treatment = treatment,
+  Sex = sex,
+  Trial = trial,
+  Estimate = emmean,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Treatment, Sex, Trial, Estimate, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS9 <- accuracy_filtered_contrasts |>
+  dplyr::mutate(trial = as.integer(trial)) |>
+  dplyr::rename(
+  Trial = trial,
+  Contrast = contrast,
+  `Estimated difference` = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Trial, Contrast, `Estimated difference`, `Lower CrI`, `Upper CrI`) |>
+  dplyr::arrange(Trial, Contrast) |>
+  finish_tbl()
+
+TableS10 <- as.data.frame(marginal_estimates_and_contrasts_accuracymodel) |>
+  dplyr::filter(contrast == ".") |>
+  dplyr::mutate(
+  treatment = factor(treatment, levels = treat_levels),
+  sex = factor(sex, levels = sex_levels)
+  ) |>
+  dplyr::rename(
+  Treatment = treatment,
+  Sex = sex,
+  `Trend over trials` = trial.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Treatment, Sex, `Trend over trials`, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS11 <- as.data.frame(marginal_estimates_and_contrasts_accuracymodel) |>
+  dplyr::filter(contrast != ".") |>
+  dplyr::rename(
+  Contrast = contrast,
+  `Estimated difference in trend` = trial.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Contrast, `Estimated difference in trend`, `Lower CrI`, `Upper CrI`) |>
+  finish_tbl()
+
+TableS12_covariates <- dplyr::bind_rows(
+  accuracy_model |>
+  emmeans(~ orientation, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  dplyr::transmute(
+  Variable = "Orientation",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ),
+  accuracy_model |>
+  emmeans(~ batch, epred = TRUE, re_formula = NA) |>
+  contrast("revpairwise") |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  dplyr::transmute(
+  Variable = "Batch",
+  `Contrast (for factors)` = contrast,
+  `Trend (for covariates)` = "-",
+  Estimate = estimate,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  ),
+  accuracy_model |>
+  emtrends(~ 1, var = "scaled_std_length", epred = TRUE, re_formula = NA) |>
+  summary(level = 0.95) |>
+  as.data.frame() |>
+  dplyr::transmute(
+  Variable = "Body size (scaled)",
+  `Contrast (for factors)` = "-",
+  `Trend (for covariates)` = "Per +1 SD in length",
+  Estimate = scaled_std_length.trend,
+  `Lower CrI` = lower.HPD,
+  `Upper CrI` = upper.HPD
+  )
+) |> finish_tbl()
+
+TableS13 <- as.data.frame(vw_contrasts_tx, stringsAsFactors = FALSE) |>
+  as_tibble() |>
+  dplyr::rename(
+  Sex = sex,
+  Contrast = contrast,
+  Estimate = median,
+  `Lower CrI`= lower.CrI,
+  `Upper CrI`= upper.CrI
+  ) |>
+  dplyr::mutate(across(c(Estimate, `Lower CrI`, `Upper CrI`), ~ as.numeric(trimws(.)))) |>
+  finish_tbl()
+
+TableS14 <- as.data.frame(vw_contrasts_sex, stringsAsFactors = FALSE) |>
+  as_tibble() |>
+  dplyr::rename(
+  Treatment = treatment,
+  Contrast = contrast,
+  Estimate = median,
+  `Lower CrI` = lower.CrI,
+  `Upper CrI` = upper.CrI
+  ) |>
+  dplyr::mutate(across(c(Estimate, `Lower CrI`, `Upper CrI`), ~ as.numeric(trimws(.)))) |>
+  finish_tbl()
+
+make_ft <- function(df) {
+  flextable(df) |>
+  theme_vanilla() |>
+  fontsize(size = 11, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  border_remove() |>
+  border(part = "header", border.top = fp_border(), border.bottom = fp_border()) |>
+  border(part = "body", i = nrow(df), border.bottom = fp_border()) |>
+  autofit()
+}
+
+make_caption <- function(full_sentence) {
+  title <- sub("^([^.]*)\\..*$", "\\1.", full_sentence)
+  rest <- sub("^[^.]*\\.\\s*(.*)$", "\\1", full_sentence)
+  if (identical(rest, full_sentence)) rest <- "" 
+  fpar(
+  ftext(title, fp_text(bold = TRUE, font.size = 11, font.family = "Times New Roman")),
+  ftext(ifelse(nchar(rest) > 0, paste0(" ", rest), ""), 
+  fp_text(font.size = 11, font.family = "Times New Roman"))
+  )
+}
+
+tables <- list(
+  list(caption = "Table S1. Posterior summaries of fixed effects from the solve-time model. Shown are parameter estimates, standard errors, and 95% credible intervals.", table = TableS1),
+  list(caption = "Table S2. Posterior marginal mean estimates of absolute solve time by treatment, sex, and trial, with 95% credible intervals.", table = TableS2),
+  list(caption = "Table S3. Pairwise contrasts of solve time across treatments and sexes at each trial, expressed as posterior median differences with 95% credible intervals.", table = TableS3),
+  list(caption = "Table S4. Posterior estimates of learning rates (trial trends in solve time) by treatment and sex, with 95% credible intervals.", table = TableS4),
+  list(caption = "Table S5. Pairwise contrasts of learning rates in solve time (slopes across trials) between treatment and sex groups, with 95% credible intervals.", table = TableS5),
+  list(caption = "Table S6. Marginal effects of orientation, batch (contrasts), and body size (trend) on solve time. Values are posterior estimates with 95% credible intervals.", table = TableS6_covariates),
+  list(caption = "Table S7. Posterior summaries of fixed effects from the accuracy model. Shown are parameter estimates, standard errors, and 95% credible intervals.", table = TableS7),
+  list(caption = "Table S8. Posterior marginal mean estimates of accuracy (incorrect entries) by treatment, sex, and trial, with 95% credible intervals.", table = TableS8),
+  list(caption = "Table S9. Pairwise contrasts of accuracy (incorrect entries) across treatments and sexes at each trial, expressed as posterior median differences with 95% credible intervals.", table = TableS9),
+  list(caption = "Table S10. Posterior estimates of learning rates in accuracy (trial trends in incorrect entries) by treatment and sex, with 95% credible intervals.", table = TableS10),
+  list(caption = "Table S11. Pairwise contrasts of accuracy learning rates (slopes across trials) between treatment and sex groups, with 95% credible intervals.", table = TableS11),
+  list(caption = "Table S12. Marginal effects of orientation, batch (contrasts), and body size (trend) on accuracy. Values are posterior estimates with 95% credible intervals.", table = TableS12_covariates),
+  list(caption = "Table S13. Posterior contrasts of within-individual variation in performance across treatments within each sex. Values are medians and 95% credible intervals.", table = TableS13),
+  list(caption = "Table S14. Posterior contrasts of within-individual variation in performance between sexes within each treatment. Values are medians and 95% credible intervals.", table = TableS14)
+)
+
+doc <- read_docx()
+for (tbl in tables) {
+  doc <- body_add_fpar(doc, make_caption(tbl$caption))
+  ft <- make_ft(tbl$table)
+  doc <- body_add_flextable(doc, ft)
+  doc <- body_add_par(doc, "")
+}
+
+print(doc, target = "./2-data/3-supplementary_results/Supplementary_Tables.docx")
+```

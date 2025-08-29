@@ -1,0 +1,148 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# Core packages for manipulation and plotting
+#install.packages("pacman")
+pacman::p_load(tidyverse, readxl, brms, emmeans, gghalves, install = TRUE, update = TRUE) 
+```
+
+```{r}
+df<- read_xlsx('./water_samples.xlsx') |> 
+  mutate(exp = ifelse(str_starts(`Sample Description`, "t"), "j", "e"),
+         amitriptyline = as.numeric(ifelse(str_starts(Amitriptyline, "<"), "0", Amitriptyline)),
+         id = `Sample Description`) |> 
+  dplyr::filter(!str_starts(`Sample No.`, "D"),
+                exp =='j') |> 
+  select(-c(exp, `Sample Description`))
+
+df$treatment <- factor(df$treatment, levels = c("control", "low", "high"))
+
+summary(df)
+```
+
+```{r}
+fig1 <- ggplot(df, aes(x = treatment, y = amitriptyline, fill = treatment)) +
+  geom_hline(yintercept = 30, color = "#FFBB7D")+
+  geom_hline(yintercept = 300, color = "#EA682F") +
+  geom_half_boxplot(errorbar.draw = F) +
+  geom_half_point(alpha = 0.3)+
+  ylab("Concentration of amitriptyline (ng/L)") +
+  xlab("Treatment group") +
+  scale_fill_manual(values = c("control" = "grey2", "low" = "#FFBB7D", "high" = "#EA682F")) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+fig1
+```
+
+```{r}
+ggplot(df, aes(x = day, y = amitriptyline, color = treatment)) +
+  geom_line(aes(group = id)) +
+  stat_summary(fun = mean, geom = "line", size = 1.5) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 30, color = "#FFBB7D") + 
+  geom_hline(yintercept = 300, color = "#EA682F") +
+  theme_classic()
+```
+
+```{r}
+model_df <- df |> 
+  filter(treatment != "control") |>
+  mutate(
+    hours = case_when(
+      day == 1 ~ 48,
+      day == 2 ~ 119,
+      day == 3 ~ 192,
+      TRUE     ~ NA_real_
+    ))
+
+hist(model_df$amitriptyline, breaks = 50)
+```
+
+
+```{r}
+formula <- bf(
+  amitriptyline ~ treatment + s(hours, by = treatment, k = 3),
+  sigma ~ treatment + s(hours, by = treatment, k = 3),
+  family = gaussian()
+)
+```
+
+
+```{r}
+model <- brm(
+  formula = formula,
+  data = model_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  iter = 6000,
+  warmup = 1000,
+  threads = threading(2),
+  chains = 4,
+  cores = 4,
+  backend = 'cmdstanr',
+  seed = 1
+)
+```
+
+
+```{r}
+summary(model)
+```
+
+```{r}
+plot(model, ask = FALSE)
+pp_check(model)
+```
+
+```{r}
+conditional_effects(model)
+```
+
+```{r}
+period <- 120  # hours per redose cycle
+
+model_df <- model_df |>
+  mutate(
+    hours = as.numeric(hours),
+    # wrap onto [0, period); 120 becomes 0, 192 -> 72, etc.
+    hours_cycle = (hours %% period)
+  )
+```
+
+
+```{r}
+formula <- bf(
+  amitriptyline ~ treatment +     
+    s(hours_cycle,
+      by = treatment,
+      k = 2,
+      bs = "cc"
+    ),
+
+  sigma ~ treatment +
+    s(hours_cycle,
+      by = treatment,
+      k = 2,
+      bs = "cc"
+    ),
+  family = gaussian()
+)
+```
+
+```{r}
+model <- brm(
+  formula = formula,
+  data = model_df,
+  knots = list(hours_cycle = c(0, period)), 
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  iter = 6000, warmup = 1000,
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = "cmdstanr",
+  seed = 1
+)
+```
+
