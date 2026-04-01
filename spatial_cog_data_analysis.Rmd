@@ -18,8 +18,10 @@ This section loads the R packages necessary for data wrangling, visualisation, B
 ```{r}
 #install.packages("pacman")
 #install.packages("cmdstanr", repos = c('https://stan-dev.r-universe.dev', getOption("repos")))
-pacman::p_load(tidyverse, readxl, ggplot2, gghalves, ggdist, ggpp , brms, emmeans, tidybayes, scales, bayesplot, patchwork, cmdstanr, bayestestR, ggh4x, marginaleffects, stringr, flextable, officer, purrr, install = TRUE, update = TRUE)
+pacman::p_load(tidyverse, readxl, ggplot2, gghalves, ggdist, ggpp , brms, emmeans, tidybayes, scales, bayesplot, patchwork, cmdstanr, bayestestR, ggh4x, marginaleffects, stringr, flextable, officer, purrr, grateful, install = TRUE, update = TRUE)
 #install_cmdstan(cores = 2, overwrite = TRUE)
+
+cite_packages(out.dir = "./6-other_material")
 ```
 
 ##1.2 Setting the Colour Palette
@@ -2427,9 +2429,52 @@ fold_baseline_sum <- q |> median_qi(fold_baseline)
 fold_baseline_sum
 ```
 
-# 4. Tables and figures for the manuscript
+# 4. Water sample analysis
 
-## 4.1 Figures
+## 4.1 Read in and summarise data
+
+```{r}
+water_sample_df<- read_xlsx('./3-water_analysis/water_samples.xlsx') |> 
+  dplyr::mutate(exp = ifelse(str_starts(`Sample Description`, "t"), "j", "e"),
+         amitriptyline = as.numeric(ifelse(str_starts(Amitriptyline, "<"), "0", Amitriptyline)),
+         id = `Sample Description`) |> 
+  dplyr::filter(!str_starts(`Sample No.`, "D"),
+                exp =='j') |> 
+  select(-c(exp, `Sample Description`))
+
+water_sample_df$treatment <- factor(water_sample_df$treatment, levels = c("control", "low", "high"))
+
+water_sample_df_summary <- water_sample_df %>%
+  group_by(treatment) %>%
+  summarise(
+    mean_amitriptyline = mean(amitriptyline, na.rm = TRUE),
+    sd_amitriptyline = sd(amitriptyline, na.rm = TRUE),
+    n = n()
+  )
+
+water_sample_df_summary
+```
+
+## 4.2 Plot water sample concentrations
+
+```{r}
+fig1 <- ggplot(water_sample_df, aes(x = treatment, y = amitriptyline, fill = treatment)) +
+  geom_hline(yintercept = 30, color = "#FFBB7D")+
+  geom_hline(yintercept = 300, color = "#EA682F") +
+  geom_half_boxplot(errorbar.draw = F) +
+  geom_half_point(alpha = 0.3)+
+  ylab("Concentration of amitriptyline (ng/L)") +
+  xlab("Treatment group") +
+  scale_fill_manual(values = c("control" = "grey2", "low" = "#FFBB7D", "high" = "#EA682F")) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+fig1
+```
+
+# 5. Tables and figures for the manuscript
+
+## 5.1 Figures
 
 ```{r}
 time_plot_treatment_comp
@@ -2441,7 +2486,151 @@ within_plot + among_plot +
   theme(legend.position = "bottom")
 ```
 
-## 4.2 Results tables
+### 5.1.1 TOC figures 
+
+```{r, fig.width=3, fig.height=2}
+accuracy_plot_graphical_abstract <- ggplot() +
+  stat_lineribbon(
+  data = accuracy_model_estimate_draws,
+  aes(x = trial, y = .value, color = treatment, fill = treatment),
+  .width = 0.95,
+  alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = accuracy_model_estimate_draws,
+  aes(x = trial, y = .value, color = treatment, fill = treatment),
+  .width = 0
+  ) +
+  scale_x_continuous(
+  breaks = c(0,3,6,9,12),
+  labels = c(0,3,6,9,12)) +
+  scale_y_continuous(
+  breaks = 0:10, 
+  labels = function(x) ifelse(x %in% c(0, 2,4,6,8, 10), as.character(x), "")
+  ) +
+  labs(
+  x = "Trial Number",
+  y = "Number of errors",
+  color = "Treatment",
+  fill = "Treatment"
+  ) +
+  scale_color_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  scale_fill_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  theme_classic(base_size = 14, base_family = "Times New Roman") +
+  theme(
+  legend.title = element_text(size = 10),
+  legend.key.size = unit(0.6, "lines"),
+  legend.spacing.y = unit(0.2, "cm"),
+  legend.spacing.x = unit(0.2, "cm"),
+  legend.margin = margin(1, 1, 1, 1),
+  legend.position = "none",
+  legend.justification = c("right", "top"),
+  legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+  legend.key = element_rect(fill = "transparent", color = NA),
+  panel.background = element_blank(),
+  plot.background = element_blank(),
+  strip.background = element_rect(
+    fill = NA,
+    colour = "white",
+    linewidth = 1
+  ),
+  axis.line = element_line(color = "white"),
+axis.ticks = element_line(color = "white"),
+axis.text = element_text(color = "white"),
+axis.title = element_text(color = "white")
+  ) +
+  ggh4x::facet_wrap2(
+  ~ sex,
+  labeller = as_labeller(c("F" = "Females", "M" = "Males")),
+  strip = ggh4x::strip_themed(
+  text_x = ggh4x::elem_list_text(size = 12, face = "bold",
+    colour = "white")
+  )
+  )
+accuracy_plot_graphical_abstract
+
+ggsave("./5-figs/accuracy_plot_graphical_abstract.png", plot = accuracy_plot_graphical_abstract, width = 3, height = 2, dpi = 300)
+```
+
+```{r, fig.width=3, fig.height=2}
+time_plot_graphical_abstract <- ggplot() +
+  stat_lineribbon(
+  data = time_model_estimate_draws,
+  aes(
+  x = trial,
+  y = .value/60,
+  color = treatment,
+  fill = treatment
+  ),
+  .width = 0.95,
+  alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = time_model_estimate_draws,
+  aes(
+  x = trial,
+  y = .value/60,
+  color = treatment,
+  fill = treatment
+  ),
+  .width = 0
+  ) +
+  scale_x_continuous(
+  breaks = c(0,3,6,9,12),
+  labels = c(0,3,6,9,12)) +
+  labs(x = "Trial Number",
+  y = "Time to solve (min)",
+  color = "Treatment",
+  fill = "Treatment") +
+  scale_color_manual(values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")) +
+  scale_fill_manual(values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")) +
+  theme_classic(base_size = 14, base_family = "Times New Roman") +
+  theme(
+  legend.title = element_text(size = 10),
+  legend.key.size = unit(0.6, "lines"),
+  legend.spacing.y = unit(0.2, "cm"),
+  legend.spacing.x = unit(0.2, "cm"),
+  legend.margin = margin(1, 1, 1, 1),
+  legend.position = "none",
+  legend.justification = c("right", "top"),
+  legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+  legend.key = element_rect(fill = "transparent", color = NA),
+  panel.background = element_blank(),
+  plot.background = element_blank(),
+  strip.background = element_rect(
+    fill = NA,
+    colour = "white",
+    linewidth = 1
+  ),
+  axis.line = element_line(color = "white"),
+axis.ticks = element_line(color = "white"),
+axis.text = element_text(color = "white"),
+axis.title = element_text(color = "white")
+  ) +
+  ggh4x::facet_wrap2(
+  ~ sex,
+  labeller = as_labeller(c("F" = "Females", "M" = "Males")),
+  strip = ggh4x::strip_themed(
+  text_x = ggh4x::elem_list_text(size = 12, face = "bold",
+    colour = "white")
+  )
+  )
+  #coord_cartesian(ylim = c(0, 4))
+  
+time_plot_graphical_abstract
+
+ggsave("./5-figs/time_plot_graphical_abstract.png", plot = time_plot_graphical_abstract, width = 3, height = 2, dpi = 300)
+```
+
+## 5.2 Results tables
 
 Here we bulk processing results tables for the manuscript and supplementary information. This includes rounding numeric values, replacing codes with descriptive text, and reordering columns. Then we save them all in one word doc.
 
@@ -2713,15 +2902,34 @@ TableS14 <- as.data.frame(vw_contrasts_sex, stringsAsFactors = FALSE) |>
   dplyr::mutate(across(c(Estimate, `Lower CrI`, `Upper CrI`), ~ as.numeric(trimws(.)))) |>
   finish_tbl()
 
+fmt_minus3 <- function(x) {
+  s <- formatC(x, format = "f", digits = 3)
+  sub("^-", "\u2212", s)
+}
+fmt_int_minus <- function(x) {
+  s <- formatC(x, format = "d")
+  sub("^-", "\u2212", s)
+}
+
 make_ft <- function(df) {
-  flextable(df) |>
-  theme_vanilla() |>
-  fontsize(size = 11, part = "all") |>
-  font(fontname = "Times New Roman", part = "all") |>
-  border_remove() |>
-  border(part = "header", border.top = fp_border(), border.bottom = fp_border()) |>
-  border(part = "body", i = nrow(df), border.bottom = fp_border()) |>
-  autofit()
+  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  fmt_list <- setNames(rep(list(fmt_minus3), length(num_cols)), num_cols)
+  trial_cols <- names(df)[tolower(names(df)) == "trial"]
+  for (tc in trial_cols) fmt_list[[tc]] <- fmt_int_minus
+
+  ft <- flextable(df) |>
+    theme_vanilla() |>
+    fontsize(size = 11, part = "all") |>
+    font(fontname = "Times New Roman", part = "all") |>
+    border_remove() |>
+    border(part = "header", border.top = fp_border(), border.bottom = fp_border()) |>
+    border(part = "body", i = nrow(df), border.bottom = fp_border())
+
+  if (length(fmt_list)) {
+    ft <- do.call(flextable::set_formatter, c(list(x = ft), fmt_list))
+  }
+
+  ft |> autofit()
 }
 
 make_caption <- function(full_sentence) {
@@ -2736,20 +2944,21 @@ make_caption <- function(full_sentence) {
 }
 
 tables <- list(
-  list(caption = "Table S1. Posterior summaries of fixed effects from the solve-time model. Shown are parameter estimates, standard errors, and 95% credible intervals.", table = TableS1),
-  list(caption = "Table S2. Posterior marginal mean estimates of absolute solve time by treatment, sex, and trial, with 95% credible intervals.", table = TableS2),
-  list(caption = "Table S3. Pairwise contrasts of solve time across treatments and sexes at each trial, expressed as posterior median differences with 95% credible intervals.", table = TableS3),
-  list(caption = "Table S4. Posterior estimates of learning rates (trial trends in solve time) by treatment and sex, with 95% credible intervals.", table = TableS4),
-  list(caption = "Table S5. Pairwise contrasts of learning rates in solve time (slopes across trials) between treatment and sex groups, with 95% credible intervals.", table = TableS5),
-  list(caption = "Table S6. Marginal effects of orientation, batch (contrasts), and body size (trend) on solve time. Values are posterior estimates with 95% credible intervals.", table = TableS6_covariates),
-  list(caption = "Table S7. Posterior summaries of fixed effects from the accuracy model. Shown are parameter estimates, standard errors, and 95% credible intervals.", table = TableS7),
-  list(caption = "Table S8. Posterior marginal mean estimates of accuracy (incorrect entries) by treatment, sex, and trial, with 95% credible intervals.", table = TableS8),
-  list(caption = "Table S9. Pairwise contrasts of accuracy (incorrect entries) across treatments and sexes at each trial, expressed as posterior median differences with 95% credible intervals.", table = TableS9),
-  list(caption = "Table S10. Posterior estimates of learning rates in accuracy (trial trends in incorrect entries) by treatment and sex, with 95% credible intervals.", table = TableS10),
-  list(caption = "Table S11. Pairwise contrasts of accuracy learning rates (slopes across trials) between treatment and sex groups, with 95% credible intervals.", table = TableS11),
-  list(caption = "Table S12. Marginal effects of orientation, batch (contrasts), and body size (trend) on accuracy. Values are posterior estimates with 95% credible intervals.", table = TableS12_covariates),
-  list(caption = "Table S13. Posterior contrasts of within-individual variation in performance across treatments within each sex. Values are medians and 95% credible intervals.", table = TableS13),
-  list(caption = "Table S14. Posterior contrasts of within-individual variation in performance between sexes within each treatment. Values are medians and 95% credible intervals.", table = TableS14)
+  list(caption = "Table S1. Posterior summaries of fixed effects from the solve-time model. Shown are parameter estimates, estimate standard errors (Est.error), and 95% credible intervals (CrI).", table = TableS1),
+  list(caption = "Table S2. Posterior marginal mean estimates of absolute solve time (sec) by treatment, sex, and trial, with 95% credible intervals (CrI).", table = TableS2),
+  list(caption = "Table S3. Pairwise contrasts of solve time (sec) across treatments and sexes at each trial, expressed as posterior median differences with 95% credible intervals (CrI).", table = TableS3),
+  list(caption = "Table S4. Posterior estimates of learning rates (trial trends in solve time) by treatment and sex, with 95% credible intervals (CrI).", table = TableS4),
+  list(caption = "Table S5. Pairwise contrasts of learning rates in solve time (slopes across trials) between treatment and sex groups, with 95% credible intervals (CrI).", table = TableS5),
+  list(caption = "Table S6. Marginal effects of orientation, batch (contrasts), and body size (trend) on solve time (sec). Values are posterior estimates with 95% credible intervals (CrI).", table = TableS6_covariates),
+  list(caption = "Table S7. Posterior summaries of fixed effects from the accuracy model. Shown are parameter estimates, estimate standard errors (Est.error), and 95% credible intervals (CrI).", table = TableS7),
+  list(caption = "Table S8. Posterior marginal mean estimates of accuracy (incorrect entries) by treatment, sex, and trial, with 95% credible intervals (CrI).", table = TableS8),
+  list(caption = "Table S9. Pairwise contrasts of accuracy (incorrect entries) across treatments and sexes at each trial, expressed as posterior median differences with 95% credible intervals (CrI).", table = TableS9),
+  list(caption = "Table S10. Posterior estimates of learning rates in accuracy (trial trends in incorrect entries) by treatment and sex, with 95% credible intervals (CrI).", table = TableS10),
+  list(caption = "Table S11. Pairwise contrasts of accuracy learning rates (slopes across trials) between treatment and sex groups, with 95% credible intervals (CrI).", table = TableS11),
+  list(caption = "Table S12. Marginal effects of orientation, batch (contrasts), and body size (trend) on accuracy. Values are posterior estimates with 95% credible intervals (CrI).", table = TableS12_covariates),
+  list(caption = "Table S13. Posterior contrasts of within-individual variation in performance across treatments within each sex. Values are medians and 95% credible intervals (CrI).", table = TableS13),
+  list(caption = "Table S14. Posterior contrasts of within-individual variation in performance between sexes within each treatment. Values are medians and 95% credible intervals (CrI).", table = TableS14),
+  list(caption = "Table S15. Pairwise contrasts of velocity and total distance travelled across treatments for males at each trial, expressed as posterior median differences with 95% credible intervals (CrI).", table = TableS15)
 )
 
 doc <- read_docx()
@@ -2762,3 +2971,232 @@ for (tbl in tables) {
 
 print(doc, target = "./2-data/3-supplementary_results/Supplementary_Tables.docx")
 ```
+
+
+# 6. Supplementary analyses
+
+Amitriptyline exposure is increases the number of errors male fish make but their solve speed is remaining consistent. To dig deeper into this I will look at how total travel distance is affected; to ensure that more errors is translated as further distance travelled as well. Then I will look at how velocity changes overtime. to see if fish in high and low exposure groups are faster overall or whether velocity increases with successive trials.
+
+```{r}
+supplementary_df <- df_complete |> 
+  mutate(
+    total_distance = as.numeric(total_distance),
+    velocity = total_distance/time_to_correct_zone_2) |> 
+  filter(mean_velocity > 0)
+
+contrasts_of_interest <- c("l M - c M","h M - c M", "h M - l M")
+
+newdata2 <- expand.grid(
+  trial = unique(supplementary_df$trial),
+  treatment = unique(supplementary_df$treatment),
+  sex = "M",
+  orientation = unique(supplementary_df$orientation),
+  batch = unique(supplementary_df$batch),
+  scaled_std_length = 0
+)
+```
+
+
+## 6.1 Distance travelled
+
+### 6.1.1 Modelling
+
+```{r}
+distance_formula <- bf(
+  total_distance ~ 1 +
+  trial * treatment * sex +
+  orientation +
+  scaled_std_length +
+  batch +
+  (1 | individual_ID),
+  family = lognormal()
+)
+
+distance_model <- brm(distance_formula, 
+  data = supplementary_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  seed = 1)
+```
+
+### 6.1.2 Model estimates
+```{r}
+distance_model_draws <- distance_model |> 
+  emmeans(~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA) |>
+  gather_emmeans_draws()
+
+distance_model_estimate_draws <- distance_model_draws |> 
+  dplyr::filter(!is.na(treatment)) |> 
+  dplyr::mutate(treatment = factor(treatment, levels = c("c", "l", "h")))
+
+distance_plot_treatment_comp <- ggplot() +
+  stat_summary(data = supplementary_df, aes(x = trial, y = total_distance, color = treatment), fun = mean, geom = "point", size = 1, alpha = 0.8, position = position_dodge(width = 0.75)) +
+  stat_summary(data = supplementary_df, aes(x = trial, y = total_distance, color = treatment), fun.data = mean_sdl, fun.args = list(mult = 1), geom = "errorbar", width = 0, alpha = 0.8, position = position_dodge(width = 0.75)) +
+  stat_lineribbon(data = distance_model_estimate_draws, aes(x = trial, y = .value, color = treatment, fill = treatment), .width = 0.95, alpha = 0.2) +
+  stat_lineribbon(data = distance_model_estimate_draws, aes(x = trial, y = .value, color = treatment, fill = treatment), .width = 0) +
+  scale_x_continuous(breaks = 1:12, labels = 1:12) + 
+  labs(
+  x = "Trial Number",
+  y = "Total distance",
+  color = "Treatment",
+  fill = "Treatment") +
+  scale_color_manual(values = c(colour_control, colour_low, colour_high), labels = c("Control", "Low", "High")) +
+  scale_fill_manual(values = c(colour_control, colour_low, colour_high), labels = c("Control", "Low", "High")) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +
+  theme(
+  legend.title = element_text(size = 10),
+  legend.key.size = unit(0.6, "lines"),
+  legend.spacing.y = unit(0.2, "cm"),
+  legend.spacing.x = unit(0.2, "cm"),
+  legend.margin = margin(1, 1, 1, 1),
+  legend.position = c(1, 0.98),
+  legend.justification = c("right", "top"),
+  legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+  legend.key = element_rect(fill = "transparent", color = NA)) +
+  facet_wrap2(~ sex,labeller = as_labeller(c("F" = "Females", "M" = "Males")), strip = strip_themed(text_x = elem_list_text(size = 12, face = "bold")))
+
+distance_plot_treatment_comp
+
+distance_model_results <- distance_model |> 
+  emmeans("revpairwise" ~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA) |> 
+  as.data.frame() |> 
+  filter(contrast %in% contrasts_of_interest) |> 
+  select(-c(treatment, sex))
+```
+
+## 6.2 Velocity
+
+### 6.2.1 Modelling
+```{r}
+velocity_formula <- bf(
+  velocity ~ 1 +
+  trial * treatment * sex +
+  orientation +
+  scaled_std_length +
+  batch +
+  (1 | individual_ID),
+  family = lognormal()
+)
+
+velocity_model <- brm(velocity_formula, 
+  data = supplementary_df,
+  control = list(adapt_delta = 0.95, max_treedepth = 12), 
+  iter = 6000, warmup = 4000, 
+  threads = threading(2),
+  chains = 4, cores = 4,
+  backend = 'cmdstanr',
+  seed = 1)
+```
+
+### 6.2.2 Model estimates
+```{r}
+velocity_model_draws <- velocity_model |> 
+  emmeans(~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA) |>
+  gather_emmeans_draws()
+
+velocity_model_estimate_draws <- velocity_model_draws |> 
+  dplyr::filter(!is.na(treatment)) |> 
+  dplyr::mutate(treatment = factor(treatment, levels = c("c", "l", "h")))
+
+velocity_plot_treatment_comp <- ggplot() +
+  stat_summary(
+  data = supplementary_df,
+  aes(x = trial, y = mean_velocity, color = treatment),
+  fun = mean,
+  geom = "point",
+  size = 1,
+  alpha = 0.8,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_summary(
+  data = supplementary_df,
+  aes(x = trial, y = mean_velocity, color = treatment),
+  fun.data = mean_sdl,
+  fun.args = list(mult = 1),
+  geom = "errorbar",
+  width = 0,
+  alpha = 0.8,
+  position = position_dodge(width = 0.75)
+  ) +
+  stat_lineribbon(
+  data = velocity_model_estimate_draws,
+  aes(x = trial, y = .value, color = treatment, fill = treatment),
+  .width = 0.95,
+  alpha = 0.2
+  ) +
+  stat_lineribbon(
+  data = velocity_model_estimate_draws,
+  aes(x = trial, y = .value, color = treatment, fill = treatment),
+  .width = 0
+  ) +
+  scale_x_continuous(
+  breaks = 1:12,
+  labels = 1:12) +
+  labs(
+  x = "Trial Number",
+  y = "velocity",
+  color = "Treatment",
+  fill = "Treatment"
+  ) +
+  scale_color_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  scale_fill_manual(
+  values = c(colour_control, colour_low, colour_high),
+  labels = c("Control", "Low", "High")
+  ) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +
+  theme(
+  legend.title = element_text(size = 10),
+  legend.key.size = unit(0.6, "lines"),
+  legend.spacing.y = unit(0.2, "cm"),
+  legend.spacing.x = unit(0.2, "cm"),
+  legend.margin = margin(1, 1, 1, 1),
+  legend.position = c(1, 0.98),
+  legend.justification = c("right", "top"),
+  legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+  legend.key = element_rect(fill = "transparent", color = NA)
+  ) +
+  facet_wrap(~sex)
+
+velocity_plot_treatment_comp
+
+velocity_model_results <- velocity_model |> 
+  emmeans("revpairwise" ~ treatment + sex | trial, at = list(trial = c(1,2,3,4,5,6,7,8,9,10,11,12)), epred = TRUE, re_formula = NA) |> 
+  as.data.frame() |> 
+  filter(contrast %in% contrasts_of_interest) |> 
+  select(-c(treatment, sex))
+```
+
+##6.3 Save results
+```{r}
+TableS15 <- bind_rows(
+  velocity_model_results |> mutate(Measure = "Velocity"),
+  distance_model_results |> mutate(Measure = "Distance")
+) |>
+  dplyr::mutate(trial = as.integer(trial)) |>
+  dplyr::rename(
+    Trial = trial,
+    Contrast = contrast,
+    `Estimated difference` = emmean,
+    `Lower CrI` = lower.HPD,
+    `Upper CrI` = upper.HPD
+  ) |>
+  dplyr::select(Measure, Trial, Contrast, `Estimated difference`, `Lower CrI`, `Upper CrI`) |>
+  dplyr::arrange(Measure, Trial, Contrast) |>
+  finish_tbl()
+
+doc_s15 <- read_docx()
+
+doc_s15 <- body_add_fpar(doc_s15, make_caption("Table S15. Pairwise contrasts of velocity and total distance travelled across treatments for males at each trial, expressed as posterior median differences with 95% credible intervals (CrI)."))
+
+doc_s15 <- body_add_flextable(doc_s15, make_ft(TableS15))
+
+print(doc_s15, target = "./2-data/3-supplementary_results/Table_S15.docx")
+```
+
+

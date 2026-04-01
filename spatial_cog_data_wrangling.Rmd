@@ -443,7 +443,7 @@ final_df <- left_join(working_df, start_times, by = "unique_id") |>
     time_to_decision_zone_1 = ifelse(
       tank %in% c(1, 2),
       time_to_decision_zone_1 + ((start - `tanks1&2_release`) / frame_rate),
-      time_to_decision_zone_1 + (`tanks3&4_release` / frame_rate)
+      time_to_decision_zone_1 + (start -`tanks3&4_release` / frame_rate)
     ),
     time_to_decision_zone_2 = ifelse(
       tank %in% c(1, 2),
